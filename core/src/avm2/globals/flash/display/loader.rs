@@ -8,6 +8,7 @@ use crate::avm2::activation::Activation;
 use crate::avm2::error::make_error_2007;
 use crate::avm2::globals::flash::display::display_object::initialize_for_allocator;
 use crate::avm2::globals::slots::flash_display_loader as loader_slots;
+use crate::avm2::globals::slots::flash_events_event_dispatcher as event_dispatcher_slots;
 use crate::avm2::globals::slots::flash_net_url_request as url_request_slots;
 use crate::avm2::globals::slots::flash_net_url_request_header as url_request_header_slots;
 use crate::avm2::object::LoaderInfoObject;
@@ -18,10 +19,13 @@ use crate::avm2::value::Value;
 use crate::avm2::{Error, Object};
 use crate::avm2_stub_method;
 use crate::backend::navigator::{NavigationMethod, Request};
+use crate::context::UpdateContext;
 use crate::display_object::LoaderDisplay;
 use crate::display_object::MovieClip;
+use crate::display_object::{DisplayObject, TDisplayObject, TDisplayObjectContainer};
 use crate::loader::LoadManager;
 use crate::loader::MovieLoaderVMData;
+use crate::string::AvmString;
 use crate::tag_utils::SwfMovie;
 use ruffle_common::tag_utils::LoadBytesInfo;
 use std::sync::Arc;
@@ -319,4 +323,113 @@ pub fn unload<'gc>(
     loader_info.unload(activation.context);
 
     Ok(Value::Undefined)
+}
+
+/// Implements `Loader.close`.
+///
+/// Cancels a load that is still in progress; the async loader stops at its
+/// next checkpoint without instantiating the content or dispatching events.
+///
+/// AdventureQuest Worlds calls this before every `unloadAndStop` when it
+/// recycles an asset slot. Without it, a player who leaves the room before
+/// their equipment finishes downloading still has that equipment instantiated,
+/// and running, after the slot has been released.
+pub fn close<'gc>(
+    activation: &mut Activation<'_, 'gc>,
+    this: Value<'gc>,
+    _args: FunctionArgs<'_, 'gc>,
+) -> Result<Value<'gc>, Error<'gc>> {
+    let this = this.as_object().unwrap();
+
+    let loader_info = this
+        .get_slot(loader_slots::_CONTENT_LOADER_INFO)
+        .as_object()
+        .unwrap()
+        .as_loader_info_object()
+        .unwrap();
+
+    activation
+        .context
+        .load_manager
+        .cancel_avm2_loads(loader_info);
+
+    Ok(Value::Undefined)
+}
+
+/// The events Flash Player strips from the unloaded content in
+/// `Loader.unloadAndStop`.
+const UNLOAD_AND_STOP_EVENTS: [&str; 5] = [
+    "enterFrame",
+    "exitFrame",
+    "frameConstructed",
+    "activate",
+    "deactivate",
+];
+
+/// Implements `Loader.unloadAndStop`.
+///
+/// Flash Player's `unloadAndStop` does everything `unload` does and also stops
+/// the unloaded content from running: it removes the content's `enterFrame`,
+/// `exitFrame`, `frameConstructed`, `activate` and `deactivate` listeners,
+/// stops its movie clips and stops its sounds.
+///
+/// The listener removal is the part that matters. `enterFrame` and friends are
+/// broadcast events, delivered to every registered display object whether or
+/// not it is on the display list. A plain `unload` detaches the content but
+/// leaves those handlers firing every frame for as long as anything keeps the
+/// content reachable -- and while weak-keyed `Dictionary`s are still strong,
+/// that can be indefinitely. Movies that load a SWF per room, such as
+/// AdventureQuest Worlds, then accumulate per-frame work on every room change.
+///
+/// Not yet implemented: stopping `Timer`s and closing `NetStream`s created by
+/// the content, removing stage listeners it added, and honouring `gc`. Ruffle
+/// does not currently track which movie created a `Timer`.
+pub fn unload_and_stop<'gc>(
+    activation: &mut Activation<'_, 'gc>,
+    this: Value<'gc>,
+    args: FunctionArgs<'_, 'gc>,
+) -> Result<Value<'gc>, Error<'gc>> {
+    let content = this
+        .as_object()
+        .and_then(|o| o.as_display_object())
+        .and_then(|d| d.as_container())
+        .and_then(|c| c.child_by_index(0));
+
+    if let Some(content) = content {
+        stop_unloaded_content(activation.context, content);
+    }
+
+    unload(activation, this, args)
+}
+
+/// Stop every movie clip in `content`'s subtree, strip its per-frame and
+/// activation listeners, and stop its sounds.
+fn stop_unloaded_content<'gc>(context: &mut UpdateContext<'gc>, content: DisplayObject<'gc>) {
+    let events = UNLOAD_AND_STOP_EVENTS.map(|e| AvmString::new_utf8(context.gc(), e));
+
+    let mut pending = vec![content];
+    while let Some(dobj) = pending.pop() {
+        if let Some(mc) = dobj.as_movie_clip() {
+            mc.stop(context);
+        }
+
+        if let Some(object) = dobj.object2() {
+            let object: Object<'gc> = object.into();
+            if let Some(list) = object
+                .get_slot(event_dispatcher_slots::DISPATCH_LIST)
+                .as_object()
+                && let Some(mut list) = list.as_dispatch_mut(context.gc())
+            {
+                for &event in &events {
+                    list.remove_all_event_listeners(event);
+                }
+            }
+        }
+
+        if let Some(container) = dobj.as_container() {
+            pending.extend(container.iter_render_list());
+        }
+    }
+
+    context.stop_sounds_on_parent_and_children(content);
 }

@@ -254,6 +254,16 @@ impl<'gc> DispatchList<'gc> {
         }
     }
 
+    /// Remove every handler for an event type, at every priority and in both
+    /// the capture and the target/bubble phases.
+    ///
+    /// Safe to call while that event is being dispatched: dispatch collects
+    /// its handlers before calling any of them, so an in-flight dispatch
+    /// completes with the handlers it started with.
+    pub fn remove_all_event_listeners(&mut self, event: AvmString<'gc>) {
+        self.0.remove(&event);
+    }
+
     /// Determine if there are any event listeners in this dispatch list.
     pub fn has_event_listener(&self, event: AvmString<'gc>) -> bool {
         if let Some(event_sheaf) = self.get_event(event) {
