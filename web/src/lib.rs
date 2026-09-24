@@ -126,6 +126,16 @@ struct RuffleInstance {
     animation_handler: Option<AnimationHandler>, // requestAnimationFrame callback
     animation_handler_id: Option<NonZeroI32>,    // requestAnimationFrame id
     background_tick_mode: bool,
+    /// Upper bound on renders per second, independent of the movie's frame
+    /// rate: the movie keeps ticking at full speed, only drawing is skipped.
+    /// `None` renders every frame that changed; `Some(0.0)` stops rendering.
+    max_render_fps: Option<f64>,
+    last_render_timestamp: Option<f64>,
+    /// Multiplier on the device pixel ratio used for the canvas backing store.
+    /// Below 1.0 the stage is drawn at reduced resolution and the browser
+    /// upscales it. Folded into `device_pixel_ratio`, which every pointer
+    /// handler already uses, so input coordinates stay correct.
+    render_scale: f64,
     mouse_move_callback: Option<JsCallback<PointerEvent>>,
     mouse_enter_callback: Option<JsCallback<PointerEvent>>,
     mouse_leave_callback: Option<JsCallback<PointerEvent>>,
@@ -368,6 +378,46 @@ impl RuffleHandle {
         let _ = self.with_core_mut(|core| core.set_volume(value));
     }
 
+    /// Limit how often the stage is rendered, without slowing the movie down.
+    ///
+    /// ActionScript, timers, sockets and ExternalInterface keep running at the
+    /// movie's frame rate; only drawing is skipped. With software rendering
+    /// (no GPU), drawing is most of the CPU cost, so this is the main lever for
+    /// automation, where nobody needs 24 frames a second of pixels.
+    ///
+    /// `fps <= 0` stops rendering entirely (except on resize). A non-finite
+    /// value, such as `Infinity`, removes the limit.
+    pub fn set_max_render_fps(&self, fps: f64) {
+        let _ = self.with_instance_mut(|instance| {
+            instance.max_render_fps = fps.is_finite().then(|| fps.max(0.0));
+        });
+    }
+
+    /// Render the stage at a fraction of its display resolution; the browser
+    /// upscales the result. Rasterisation cost scales with pixel count, so 0.5
+    /// draws a quarter of the pixels -- the biggest single saving when there
+    /// is no GPU. Clamped to 0.1..=2.0. Takes effect on the next frame.
+    pub fn set_render_scale(&self, scale: f64) {
+        let _ = self.with_instance_mut(|instance| {
+            instance.render_scale = if scale.is_finite() {
+                scale.clamp(0.1, 2.0)
+            } else {
+                1.0
+            };
+        });
+    }
+
+    pub fn render_scale(&self) -> f64 {
+        self.with_instance(|instance| instance.render_scale)
+            .unwrap_or(1.0)
+    }
+
+    /// The current render limit; `Infinity` when unlimited.
+    pub fn max_render_fps(&self) -> f64 {
+        self.with_instance(|instance| instance.max_render_fps.unwrap_or(f64::INFINITY))
+            .unwrap_or(f64::INFINITY)
+    }
+
     pub fn renderer_debug_info(&self) -> JsValue {
         self.with_core(|core| JsValue::from_str(&core.renderer().debug_info()))
             .unwrap_or(JsValue::NULL)
@@ -553,6 +603,9 @@ impl RuffleHandle {
             animation_handler: None,
             animation_handler_id: None,
             background_tick_mode: false,
+            max_render_fps: None,
+            last_render_timestamp: None,
+            render_scale: 1.0,
             mouse_move_callback: None,
             mouse_enter_callback: None,
             mouse_leave_callback: None,
@@ -1122,12 +1175,14 @@ impl RuffleHandle {
     fn tick(self, timestamp: f64) {
         let mut dt = 0.0;
         let mut new_dimensions = None;
+        let mut render_allowed = true;
         let mut gamepad_button_events = Vec::new();
         let _ = self.with_instance_mut(|instance| {
             // Check for canvas resize.
             let canvas_width = instance.canvas.client_width();
             let canvas_height = instance.canvas.client_height();
-            let device_pixel_ratio = instance.window.device_pixel_ratio(); // Changes via user zooming.
+            // Changes via user zooming, or via `set_render_scale`.
+            let device_pixel_ratio = instance.window.device_pixel_ratio() * instance.render_scale;
             if instance.canvas_width != canvas_width
                 || instance.canvas_height != canvas_height
                 || (instance.device_pixel_ratio - device_pixel_ratio).abs() >= f64::EPSILON
@@ -1222,10 +1277,20 @@ impl RuffleHandle {
 
             // Store the timestamp of the last tick.
             instance.timestamp = Some(timestamp);
+
+            render_allowed = match instance.max_render_fps {
+                None => true,
+                Some(fps) if fps <= 0.0 => false,
+                // 1ms of slack so a 60Hz rAF doesn't alias against the limit
+                // and skip one extra frame each interval.
+                Some(fps) => instance
+                    .last_render_timestamp
+                    .is_none_or(|last| timestamp - last >= 1000.0 / fps - 1.0),
+            };
         });
 
         // Tick the Ruffle core.
-        let _ = self.with_core_mut(|core| {
+        let rendered = self.with_core_mut(|core| {
             for event in gamepad_button_events {
                 core.handle_event(event);
             }
@@ -1245,11 +1310,22 @@ impl RuffleHandle {
 
             core.tick(FloatDuration::from_millis(dt));
 
-            // Render if the core signals a new frame, or if we resized.
-            if core.needs_render() || new_dimensions.is_some() {
+            // Render if the core signals a new frame and the render limit
+            // allows it, or unconditionally if we resized (the canvas was
+            // cleared). A skipped frame leaves `needs_render` set, so the next
+            // allowed tick draws the latest state.
+            let render = (core.needs_render() && render_allowed) || new_dimensions.is_some();
+            if render {
                 core.render();
             }
+            render
         });
+
+        if matches!(rendered, Ok(true)) {
+            let _ = self.with_instance_mut(|instance| {
+                instance.last_render_timestamp = Some(timestamp);
+            });
+        }
     }
 
     fn on_metadata(self, swf_header: &ruffle_core::swf::HeaderExt) {

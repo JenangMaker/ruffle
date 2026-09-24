@@ -1066,6 +1066,58 @@ export class InnerPlayer {
     }
 
     /**
+     * The most times per second the stage is rendered.
+     *
+     * The movie itself keeps running at its own frame rate; only drawing is
+     * skipped. `0` stops rendering, `Infinity` (the default) removes the limit.
+     *
+     * @returns The render limit.
+     */
+    get maxRenderFps(): number {
+        if (this.instance) {
+            return this.instance.max_render_fps();
+        }
+        return Infinity;
+    }
+
+    /**
+     * Limits how often the stage is rendered, without slowing the movie.
+     *
+     * @param value Renders per second. `0` stops rendering, `Infinity` removes
+     * the limit.
+     */
+    set maxRenderFps(value: number) {
+        if (this.instance) {
+            this.instance.set_max_render_fps(value);
+        }
+    }
+
+    /**
+     * The fraction of display resolution the stage is rendered at.
+     *
+     * @returns The render scale, 1.0 by default.
+     */
+    get renderScale(): number {
+        if (this.instance) {
+            return this.instance.render_scale();
+        }
+        return 1.0;
+    }
+
+    /**
+     * Renders the stage at a fraction of its display resolution and lets the
+     * browser upscale it. Pixel count dominates software rendering, so 0.5
+     * draws a quarter of the pixels.
+     *
+     * @param value Scale factor, clamped to 0.1 - 2.0.
+     */
+    set renderScale(value: number) {
+        if (this.instance) {
+            this.instance.set_render_scale(value);
+        }
+    }
+
+    /**
      * Checks if this player is allowed to be fullscreen by the browser.
      *
      * @returns True if you may call [[enterFullscreen]].
