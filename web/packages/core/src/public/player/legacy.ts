@@ -164,6 +164,41 @@ export interface LegacyRuffleAPI {
     set volume(value: number);
 
     /**
+     * The most times per second the stage is rendered. The movie keeps
+     * running at its own frame rate; only drawing is skipped.
+     *
+     * @returns The render limit. `0` means rendering is stopped, `Infinity`
+     * means unlimited.
+     */
+    get maxRenderFps(): number;
+
+    /**
+     * Limits how often the stage is rendered, without slowing the movie.
+     * Useful for automation and for software rendering, where drawing
+     * dominates CPU use.
+     *
+     * @param value Renders per second. `0` stops rendering, `Infinity`
+     * removes the limit.
+     */
+    set maxRenderFps(value: number);
+
+    /**
+     * The fraction of display resolution the stage is rendered at.
+     *
+     * @returns The render scale, 1.0 by default.
+     */
+    get renderScale(): number;
+
+    /**
+     * Renders the stage at a fraction of its display resolution; the browser
+     * upscales it. Pixel count dominates software rendering, so 0.5 draws a
+     * quarter of the pixels.
+     *
+     * @param value Scale factor, clamped to 0.1 - 2.0.
+     */
+    set renderScale(value: number);
+
+    /**
      * Checks if this player is allowed to be fullscreen by the browser.
      *
      * @returns True if you may call {@link enterFullscreen}.

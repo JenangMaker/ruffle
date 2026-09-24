@@ -127,6 +127,22 @@ export class RufflePlayerElement extends HTMLElement implements PlayerElement {
         this.#inner.volume = value;
     }
 
+    get maxRenderFps(): number {
+        return this.#inner.maxRenderFps;
+    }
+
+    set maxRenderFps(value: number) {
+        this.#inner.maxRenderFps = value;
+    }
+
+    get renderScale(): number {
+        return this.#inner.renderScale;
+    }
+
+    set renderScale(value: number) {
+        this.#inner.renderScale = value;
+    }
+
     get fullscreenEnabled(): boolean {
         return this.#inner.fullscreenEnabled;
     }
