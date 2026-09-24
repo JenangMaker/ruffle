@@ -1,0 +1,13 @@
+loaded
+child ran before unload: true
+before: root has enterFrame: true
+before: inner has enterFrame: true
+before: inner has exitFrame: true
+loader.content after: null
+after: root has enterFrame: false
+after: inner has enterFrame: false
+after: inner has exitFrame: false
+root enterFrame ticks since unloadAndStop: 0
+inner enterFrame ticks since unloadAndStop: 0
+inner exitFrame ticks since unloadAndStop: 0
+done

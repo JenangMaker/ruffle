@@ -259,21 +259,23 @@ impl<'gc> LoadManager<'gc> {
         self.0.get_mut(handle)
     }
 
-    /// Checks if the target clip on the given handle's loader
-    /// has been `avm1_removed()`. If so, it will set the `loader_status`
-    /// to `Failed` and return `true`.
+    /// Checks whether the given handle's load has been cancelled: either its
+    /// AVM1 target clip has been `avm1_removed()`, or it was cancelled by
+    /// `Loader.close()` (see `cancel_avm2_loads`). If so, it will set the
+    /// `loader_status` to `Failed` and return `true`.
     /// This is used to prevent a loaded movie from executing
-    /// if its target clip was removed before it finished loading.
+    /// if it was abandoned before it finished loading.
     // TODO: Does this need adjusted for clip unloading?
     // (see the avm1/load_cancel_via_unloadclip and avm1/load_cancel_via_unloadmovie tests)
-    pub fn load_cancelled_avm1(&mut self, handle: LoaderHandle) -> bool {
+    pub fn load_cancelled(&mut self, handle: LoaderHandle) -> bool {
         match self.get_loader_mut(handle) {
             Some(MovieLoader {
                 loader_status,
                 target_clip,
+                cancelled,
                 ..
             }) => {
-                if target_clip.avm1_removed() {
+                if *cancelled || target_clip.avm1_removed() {
                     *loader_status = LoaderStatus::Failed;
                     return true;
                 }
@@ -281,6 +283,33 @@ impl<'gc> LoadManager<'gc> {
             _ => unreachable!(),
         }
         false
+    }
+
+    /// Cancel every pending AVM2 load into `loader_info`, as
+    /// `Loader.close()` does.
+    ///
+    /// Only loads that have not started instantiating their content are
+    /// affected; the async loader notices at its next checkpoint and stops
+    /// without dispatching any events. A later `load()` on the same `Loader`
+    /// creates a fresh handle and is unaffected.
+    ///
+    /// Returns how many loads were cancelled.
+    pub fn cancel_avm2_loads(&mut self, loader_info: LoaderInfoObject<'gc>) -> usize {
+        let mut cancelled = 0;
+        for (_handle, loader) in self.0.iter_mut() {
+            if let MovieLoaderVMData::Avm2 {
+                loader_info: target,
+                ..
+            } = &loader.vm_data
+                && std::ptr::eq(target.as_ptr(), loader_info.as_ptr())
+                && matches!(loader.loader_status, LoaderStatus::Pending)
+                && !loader.cancelled
+            {
+                loader.cancelled = true;
+                cancelled += 1;
+            }
+        }
+        cancelled
     }
 
     /// Kick off a movie clip load.
@@ -320,6 +349,7 @@ impl<'gc> LoadManager<'gc> {
             vm_data,
             loader_status: LoaderStatus::Pending,
             movie: None,
+            cancelled: false,
         };
         let handle = self.add_loader(loader);
         let loader = self.get_loader_mut(handle).unwrap();
@@ -408,6 +438,7 @@ impl<'gc> LoadManager<'gc> {
             vm_data,
             loader_status: LoaderStatus::Pending,
             movie: None,
+            cancelled: false,
         };
         let handle = context.load_manager.add_loader(loader);
         MovieLoader::movie_loader_bytes(handle, context, loader_url, bytes)
@@ -593,6 +624,11 @@ pub struct MovieLoader<'gc> {
     /// completed and we expect the Player to periodically tick preload
     /// until loading completes.
     movie: Option<Arc<SwfMovie>>,
+
+    /// Set by `Loader.close()`. The async loader checks this at the same
+    /// points it checks for an AVM1 target clip having been removed.
+    #[collect(require_static)]
+    cancelled: bool,
 }
 
 impl<'gc> MovieLoader<'gc> {
@@ -702,8 +738,10 @@ impl<'gc> MovieLoader<'gc> {
                     None => return Err(Error::Cancelled),
                 };
 
-                if uc.load_manager.load_cancelled_avm1(handle) {
-                    tracing::warn!("movie_loader: Target clip was already AVM1 removed");
+                if uc.load_manager.load_cancelled(handle) {
+                    tracing::warn!(
+                        "movie_loader: load was cancelled or its AVM1 target clip removed"
+                    );
                     return Err(Error::Cancelled);
                 }
 
@@ -1671,8 +1709,8 @@ impl<'gc> MovieLoader<'gc> {
 
         let from_bytes = load_bytes_info.is_some();
 
-        if uc.load_manager.load_cancelled_avm1(handle) {
-            tracing::warn!("movie_loader_data: Target clip was already avm1_removed");
+        if uc.load_manager.load_cancelled(handle) {
+            tracing::warn!("movie_loader_data: load was cancelled or its AVM1 target clip removed");
             return Ok(());
         }
 
