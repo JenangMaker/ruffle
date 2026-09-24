@@ -98,6 +98,12 @@ pub struct LoaderInfoObjectData<'gc> {
     expose_content: Cell<bool>,
 
     errored: Cell<bool>,
+
+    /// `(bytes downloaded, expected total)` while the response body is still
+    /// arriving, before there is a movie to take byte counts from. Backs
+    /// `bytesLoaded` / `bytesTotal` during that window, as in Flash Player;
+    /// scripts that watch for a stalled download rely on it growing.
+    download_progress: Cell<Option<(usize, usize)>>,
 }
 
 impl<'gc> LoaderInfoObject<'gc> {
@@ -142,6 +148,7 @@ impl<'gc> LoaderInfoObject<'gc> {
                 content_type: Cell::new(ContentType::Unknown),
                 expose_content: Cell::new(false),
                 errored: Cell::new(false),
+                download_progress: Cell::new(None),
             },
         ));
 
@@ -177,6 +184,15 @@ impl<'gc> LoaderInfoObject<'gc> {
 
     pub fn errored(self) -> bool {
         self.0.errored.get()
+    }
+
+    /// See `LoaderInfoObjectData::download_progress`.
+    pub fn download_progress(self) -> Option<(usize, usize)> {
+        self.0.download_progress.get()
+    }
+
+    pub fn set_download_progress(self, progress: Option<(usize, usize)>) {
+        self.0.download_progress.set(progress);
     }
 
     pub fn init_event_fired(self) -> bool {
@@ -285,6 +301,7 @@ impl<'gc> LoaderInfoObject<'gc> {
         let loader_stream = LoaderStream::NotYetLoaded(empty_swf, None, false);
         self.set_loader_stream(loader_stream, context.gc());
         self.set_errored(false);
+        self.set_download_progress(None);
         self.reset_init_and_complete_events();
 
         // Remove the Loader's content element if it exists.

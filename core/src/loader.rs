@@ -542,6 +542,74 @@ async fn wait_for_full_response(
     }
 }
 
+/// Download a movie's response body chunk by chunk.
+///
+/// Flash Player dispatches `progress` on a `Loader` as data arrives, and its
+/// `LoaderInfo.bytesLoaded` grows throughout the download. Content relies on
+/// that: AdventureQuest Worlds gives every asset load five seconds to show
+/// progress, and aborts it with `Loader.close()` otherwise. Waiting for the
+/// whole body first made any slow asset look dead.
+///
+/// Every chunk except the last is reported here; the finished body is
+/// reported by the existing data and preload path, so a body that arrives in
+/// one piece dispatches exactly what it did before.
+///
+/// Returns `None` if the load was cancelled part-way.
+async fn stream_response(
+    player: &Arc<Mutex<Player>>,
+    handle: LoaderHandle,
+    fetch: OwnedFuture<Box<dyn SuccessResponse>, ErrorResponse>,
+) -> Option<Result<(Vec<u8>, String, u16, bool), ErrorResponse>> {
+    let mut response = match fetch.await {
+        Ok(response) => response,
+        Err(error) => return Some(Err(error)),
+    };
+    let url = response.url().to_string();
+    let status = response.status();
+    let redirected = response.redirected();
+    let total = response
+        .expected_length()
+        .ok()
+        .flatten()
+        .map_or(0, |len| len as usize);
+
+    let cancelled = player
+        .lock()
+        .unwrap()
+        .update(|uc| MovieLoader::report_download_progress(handle, uc, 0, total, false));
+    if cancelled {
+        return None;
+    }
+
+    let mut body = Vec::with_capacity(total);
+    loop {
+        match response.next_chunk().await {
+            Ok(Some(chunk)) => {
+                body.extend_from_slice(&chunk);
+                if total == 0 || body.len() < total {
+                    let loaded = body.len();
+                    let cancelled = player.lock().unwrap().update(|uc| {
+                        MovieLoader::report_download_progress(
+                            handle,
+                            uc,
+                            loaded,
+                            total.max(loaded),
+                            true,
+                        )
+                    });
+                    if cancelled {
+                        return None;
+                    }
+                }
+            }
+            Ok(None) => break,
+            Err(error) => return Some(Err(ErrorResponse { url, error })),
+        }
+    }
+
+    Some(Ok((body, url, status, redirected)))
+}
+
 /// The completion status of a `Loader` loading a movie.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LoaderStatus {
@@ -781,7 +849,17 @@ impl<'gc> MovieLoader<'gc> {
                 MovieLoader::movie_loader_start(handle, uc)
             })?;
 
-            let response = wait_for_full_response(fetch).await;
+            // Stream the body so AVM2 Loaders see `progress` events and a
+            // growing `bytesLoaded` while it downloads, as in Flash Player.
+            // Replacing the root movie keeps the all-at-once path.
+            let response = if replacing_root_movie {
+                wait_for_full_response(fetch).await
+            } else {
+                match stream_response(&player, handle, fetch).await {
+                    Some(response) => response,
+                    None => return Err(Error::Cancelled),
+                }
+            };
             let player = player.lock().unwrap();
             match response {
                 Ok((body, url, status, redirected)) if replacing_root_movie => {
@@ -2033,6 +2111,38 @@ impl<'gc> MovieLoader<'gc> {
     /// Report a movie loader progress event to script code.
     ///
     /// The current and total length are always reported as compressed lengths.
+    /// Report part of a movie's body having arrived: for AVM2 `Loader`s this
+    /// updates `LoaderInfo.bytesLoaded` / `bytesTotal`, and dispatches
+    /// `progress` if `dispatch` is set.
+    ///
+    /// Returns `true` if the load has been cancelled and the download should
+    /// stop.
+    fn report_download_progress(
+        handle: LoaderHandle,
+        uc: &mut UpdateContext<'gc>,
+        loaded: usize,
+        total: usize,
+        dispatch: bool,
+    ) -> bool {
+        if uc.load_manager.get_loader(handle).is_none() || uc.load_manager.load_cancelled(handle) {
+            return true;
+        }
+
+        if let Some(MovieLoader {
+            vm_data: MovieLoaderVMData::Avm2 { loader_info, .. },
+            ..
+        }) = uc.load_manager.get_loader(handle)
+        {
+            let loader_info = *loader_info;
+            loader_info.set_download_progress(Some((loaded, total)));
+            if dispatch {
+                let _ = Self::movie_loader_progress(handle, uc, loaded, total);
+            }
+        }
+
+        false
+    }
+
     fn movie_loader_progress(
         handle: LoaderHandle,
         uc: &mut UpdateContext<'gc>,
