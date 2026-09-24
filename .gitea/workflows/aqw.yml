@@ -1,0 +1,173 @@
+# Builds and tests the AQW-patched Ruffle on Gitea Actions.
+#
+# The existence of this directory also stops Gitea from running Ruffle's
+# upstream .github/workflows (fuzzing, extension builds, the full test
+# matrix): Gitea ignores .github/workflows once .gitea/workflows exists
+# (go-gitea/gitea#31456).
+#
+# Jobs:
+#   test  - the Loader regression tests this fork adds, plus the rest of
+#           avm2/loader*, so a Ruffle update that breaks them is caught.
+#   web   - builds the self-hosted web package, uploads it as a run artifact
+#           and publishes it to this Gitea's generic package registry as
+#             ruffle-aqw/<version>/ruffle-aqw-selfhosted.zip
+#             ruffle-aqw/latest/ruffle-aqw-selfhosted.zip
+#           Point VibeSkua's RUFFLE_WEB_URL at the `latest` one.
+#
+# Publishing needs a PACKAGE_USERNAME variable and a PACKAGE_TOKEN secret
+# (write:package) on this repo or its owner; without them the zip is still
+# built and uploaded as an artifact, just not published.
+
+name: AQW build
+
+on:
+  push:
+    branches: ["aqw-**"]
+    tags: ["aqw-*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+  # Keep in step with Cargo.lock; checked below.
+  WASM_BINDGEN_VERSION: "0.2.127"
+  BINARYEN_VERSION: "133"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    container:
+      image: node:22-bookworm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Java and Rust
+        run: |
+          set -eu
+          apt-get update
+          # Java compiles Ruffle's playerglobal ActionScript at build time.
+          apt-get install -y --no-install-recommends default-jre-headless
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        continue-on-error: true
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: aqw-test-${{ hashFiles('Cargo.lock') }}
+
+      - name: Loader regression tests
+        run: cargo test -p tests --test tests -- avm2/loader
+
+  web:
+    runs-on: ubuntu-latest
+    container:
+      image: node:22-bookworm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          set -eu
+          apt-get update
+          apt-get install -y --no-install-recommends default-jre-headless zip
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+          . "$HOME/.cargo/env"
+          rustup target add wasm32-unknown-unknown
+
+          # wasm-bindgen-cli must match the wasm-bindgen crate exactly.
+          LOCKED=$(grep -A1 '^name = "wasm-bindgen"$' Cargo.lock | sed -n 's/^version = "\(.*\)"/\1/p')
+          if [ "$LOCKED" != "$WASM_BINDGEN_VERSION" ]; then
+            echo "Cargo.lock wants wasm-bindgen $LOCKED but WASM_BINDGEN_VERSION is $WASM_BINDGEN_VERSION"
+            exit 1
+          fi
+          mkdir -p "$HOME/tools"
+          curl -sSL "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/${LOCKED}/wasm-bindgen-${LOCKED}-x86_64-unknown-linux-musl.tar.gz" \
+            | tar -xz -C "$HOME/tools" --strip-components=1
+          curl -sSL "https://github.com/WebAssembly/binaryen/releases/download/version_${BINARYEN_VERSION}/binaryen-version_${BINARYEN_VERSION}-x86_64-linux.tar.gz" \
+            | tar -xz -C "$HOME/tools" --strip-components=2 "binaryen-version_${BINARYEN_VERSION}/bin"
+
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          echo "$HOME/tools" >> "$GITHUB_PATH"
+
+      - name: Report versions
+        run: |
+          rustc --version
+          wasm-bindgen --version
+          wasm-opt --version
+          java -version 2>&1 | head -1
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        continue-on-error: true
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: aqw-web-${{ hashFiles('Cargo.lock') }}
+
+      - name: Build self-hosted web package
+        working-directory: web
+        run: |
+          set -eu
+          npm ci --no-audit --no-fund
+          npm run build --workspace=ruffle-core
+          npm run build --workspace=ruffle-selfhosted
+          ls -la packages/selfhosted/dist
+
+      - name: Package
+        id: pkg
+        run: |
+          set -eu
+          # Package versions must be unique; branch or tag name plus commit.
+          REF=$(echo "${{ github.ref_name }}" | tr '/' '-')
+          VERSION="${REF}-$(echo "${{ github.sha }}" | cut -c1-8)"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          cd web/packages/selfhosted/dist
+          zip -qr "$GITHUB_WORKSPACE/ruffle-aqw-selfhosted.zip" .
+          ls -la "$GITHUB_WORKSPACE/ruffle-aqw-selfhosted.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: ruffle-aqw-selfhosted
+          path: ruffle-aqw-selfhosted.zip
+          retention-days: 30
+
+      - name: Publish to package registry
+        env:
+          PKG_USER: ${{ vars.PACKAGE_USERNAME }}
+          PKG_TOKEN: ${{ secrets.PACKAGE_TOKEN }}
+        run: |
+          set -eu
+          if [ -z "${PKG_USER:-}" ] || [ -z "${PKG_TOKEN:-}" ]; then
+            echo "PACKAGE_USERNAME / PACKAGE_TOKEN not set on this repo: skipping publish."
+            echo "The zip is still available as the run artifact."
+            exit 0
+          fi
+          BASE="${{ github.server_url }}/api/packages/${{ github.repository_owner }}/generic/ruffle-aqw"
+          FILE=ruffle-aqw-selfhosted.zip
+
+          put() {
+            code=$(curl -s -o /tmp/put.out -w '%{http_code}' --user "$PKG_USER:$PKG_TOKEN" \
+              --upload-file "$FILE" "$BASE/$1/$FILE")
+            echo "PUT $1 -> HTTP $code"
+            case "$code" in 200|201) ;; *) cat /tmp/put.out; exit 1 ;; esac
+          }
+
+          put "${{ steps.pkg.outputs.version }}"
+
+          # Generic package files are immutable, so `latest` is replaced by
+          # deleting that version first. A 404 just means it didn't exist yet.
+          curl -s -o /dev/null -w "DELETE latest -> HTTP %{http_code}\n" -X DELETE \
+            --user "$PKG_USER:$PKG_TOKEN" "$BASE/latest"
+          put latest
+
+          echo "Published:"
+          echo "  $BASE/${{ steps.pkg.outputs.version }}/$FILE"
+          echo "  $BASE/latest/$FILE"
