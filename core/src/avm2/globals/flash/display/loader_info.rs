@@ -88,6 +88,14 @@ pub fn get_bytes_total<'gc>(
     if let Some(loader_stream) = this.as_loader_info_object().map(|o| o.loader_stream()) {
         match &*loader_stream {
             LoaderStream::NotYetLoaded(swf, _, _) => {
+                // Still downloading: report the expected length if we know it.
+                if let Some((_, total)) = this
+                    .as_loader_info_object()
+                    .and_then(|o| o.download_progress())
+                    && total > 0
+                {
+                    return Ok(Value::from_usize_lossy(total));
+                }
                 return Ok(Value::from_usize_lossy(swf.compressed_len()));
             }
             LoaderStream::Swf(movie, _) => {
@@ -108,23 +116,30 @@ pub fn get_bytes_loaded<'gc>(
     let this = this.as_object().unwrap();
 
     let loader_info = this.as_loader_info_object().unwrap();
+    // Bytes of the response body received so far. While a `Loader` is still
+    // downloading there is no movie to count parsed bytes from -- an AVM2
+    // Loader has only a placeholder root clip -- and Flash Player reports the
+    // download instead. Once parsing starts, parsed bytes take over.
+    let downloaded = loader_info
+        .download_progress()
+        .map_or(0, |(loaded, _)| loaded);
     let loader_stream = loader_info.loader_stream();
     match &*loader_stream {
         LoaderStream::NotYetLoaded(swf, None, _) => {
             if loader_info.errored() {
                 return Ok(Value::from_usize_lossy(swf.compressed_len()));
             }
-            Ok(0.into())
+            Ok(Value::from_usize_lossy(downloaded))
         }
         LoaderStream::Swf(swf, root) | LoaderStream::NotYetLoaded(swf, Some(root), _) => {
             if root.as_bitmap().is_some() {
                 return Ok(Value::from_usize_lossy(swf.compressed_len()));
             }
-            Ok(root
+            let parsed = root
                 .as_movie_clip()
-                .map(|mc| mc.compressed_loaded_bytes())
-                .unwrap_or_default()
-                .into())
+                .map(|mc| mc.compressed_loaded_bytes() as usize)
+                .unwrap_or_default();
+            Ok(Value::from_usize_lossy(parsed.max(downloaded)))
         }
     }
 }
