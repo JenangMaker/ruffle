@@ -40,6 +40,8 @@ members = [
     "tools/stub-report",
 ]
 default-members = ["desktop"]
+# Patched third-party crates (see [patch.crates-io]); not workspace members.
+exclude = ["vendor/wgpu-core"]
 resolver = "2"
 
 [workspace.package]
@@ -200,3 +202,10 @@ lto = "off"
 incremental = true
 # Right between the defaults of 16 and 256, for crate fragment caching.
 codegen-units = 64
+
+# wgpu-core 30.0.1 with one change in src/track/metadata.rs: clearing a usage
+# scope resets only the entries it owns instead of dropping and refilling a
+# table sized to every buffer/texture ever allocated. That table churn cost
+# ~40% of the main thread per frame in AQW. See vendor/wgpu-core/PATCHED.md.
+[patch.crates-io]
+wgpu-core = { path = "vendor/wgpu-core" }
