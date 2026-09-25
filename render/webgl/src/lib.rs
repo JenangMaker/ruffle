@@ -174,6 +174,33 @@ fn as_registry_data(handle: &BitmapHandle) -> &RegistryData {
     <dyn Any>::downcast_ref(&*handle.0).expect("Bitmap handle must be webgl RegistryData")
 }
 
+/// Result of `render_offscreen`: the pixels are already in the bitmap's
+/// texture; resolving reads `bounds` back with `readPixels`.
+#[derive(Debug)]
+struct OffscreenSyncHandle {
+    handle: BitmapHandle,
+    bounds: PixelRegion,
+}
+
+impl SyncHandle for OffscreenSyncHandle {}
+
+/// A framebuffer rendering into a bitmap's texture, torn down on drop.
+struct TextureFramebuffer {
+    gl: Gl,
+    framebuffer: WebGlFramebuffer,
+    stencil: Option<WebGlRenderbuffer>,
+}
+
+impl Drop for TextureFramebuffer {
+    fn drop(&mut self) {
+        self.gl.bind_framebuffer(Gl::FRAMEBUFFER, None);
+        self.gl.delete_framebuffer(Some(&self.framebuffer));
+        if let Some(stencil) = &self.stencil {
+            self.gl.delete_renderbuffer(Some(stencil));
+        }
+    }
+}
+
 const MAX_GRADIENT_COLORS: usize = 15;
 
 impl WebGlRenderBackend {
@@ -783,7 +810,9 @@ impl WebGlRenderBackend {
             .blend_func_separate(src_rgb, dst_rgb, Gl::ONE, Gl::ONE_MINUS_SRC_ALPHA);
     }
 
-    fn begin_frame(&mut self, clear: Color) {
+    /// Forgets cached per-draw state, so the next draw re-uploads the view
+    /// matrix and colors, and starts with no masks.
+    fn reset_draw_state(&mut self) {
         self.active_program = std::ptr::null();
         self.mask_state = MaskState::NoMask;
         self.num_masks = 0;
@@ -791,6 +820,10 @@ impl WebGlRenderBackend {
 
         self.mult_color = None;
         self.add_color = None;
+    }
+
+    fn begin_frame(&mut self, clear: Color) {
+        self.reset_draw_state();
 
         // Bind to MSAA render buffer if using MSAA.
         if let Some(msaa_buffers) = &self.msaa_buffers {
@@ -983,6 +1016,76 @@ impl WebGlRenderBackend {
         self.gl
             .draw_elements_with_i32(MODE, count, Gl::UNSIGNED_INT, 0);
     }
+
+    /// Binds a new framebuffer that renders into `data`'s texture, with a
+    /// stencil buffer for masks if asked. Textures from `create_empty_texture`
+    /// have no storage yet; they get a transparent RGBA image first.
+    fn bind_texture_framebuffer(
+        &self,
+        data: &RegistryData,
+        with_stencil: bool,
+    ) -> Result<TextureFramebuffer, Error> {
+        let gl = &self.gl;
+        let (width, height) = (data.width as i32, data.height as i32);
+
+        let framebuffer = gl
+            .create_framebuffer()
+            .ok_or(Error::UnableToCreateFrameBuffer)?;
+        gl.bind_framebuffer(Gl::FRAMEBUFFER, Some(&framebuffer));
+        let mut target = TextureFramebuffer {
+            gl: gl.clone(),
+            framebuffer,
+            stencil: None,
+        };
+
+        let attach = || {
+            gl.framebuffer_texture_2d(
+                Gl::FRAMEBUFFER,
+                Gl::COLOR_ATTACHMENT0,
+                Gl::TEXTURE_2D,
+                Some(&data.texture),
+                0,
+            )
+        };
+        attach();
+        if gl.check_framebuffer_status(Gl::FRAMEBUFFER) != Gl::FRAMEBUFFER_COMPLETE {
+            gl.bind_texture(Gl::TEXTURE_2D, Some(&data.texture));
+            gl.tex_image_2d_with_i32_and_i32_and_i32_and_format_and_type_and_opt_u8_array(
+                Gl::TEXTURE_2D,
+                0,
+                Gl::RGBA as i32,
+                width,
+                height,
+                0,
+                Gl::RGBA,
+                Gl::UNSIGNED_BYTE,
+                None,
+            )
+            .into_js_result()?;
+            attach();
+        }
+
+        if with_stencil {
+            let stencil = gl
+                .create_renderbuffer()
+                .ok_or(Error::UnableToCreateRenderBuffer)?;
+            gl.bind_renderbuffer(Gl::RENDERBUFFER, Some(&stencil));
+            gl.renderbuffer_storage(Gl::RENDERBUFFER, Gl::STENCIL_INDEX8, width, height);
+            gl.framebuffer_renderbuffer(
+                Gl::FRAMEBUFFER,
+                Gl::STENCIL_ATTACHMENT,
+                Gl::RENDERBUFFER,
+                Some(&stencil),
+            );
+            target.stencil = Some(stencil);
+        }
+
+        let status = gl.check_framebuffer_status(Gl::FRAMEBUFFER);
+        if status != Gl::FRAMEBUFFER_COMPLETE {
+            return Err(Error::GLError("offscreen framebuffer incomplete", status));
+        }
+        Ok(target)
+    }
 }
 
 fn same_blend_mode(first: Option<&RenderBlendMode>, second: &RenderBlendMode) -> bool {
@@ -993,14 +1096,69 @@ fn same_blend_mode(first: Option<&RenderBlendMode>, second: &RenderBlendMode) ->
 }
 
 impl RenderBackend for WebGlRenderBackend {
+    /// `BitmapData.draw`: runs `commands` over the bitmap's current texture.
+    ///
+    /// Renders straight into the texture (no MSAA; `_quality` is ignored). The
+    /// view matrix keeps image row 0 at texture row 0, which is how bitmaps are
+    /// uploaded and how `readPixels` returns them. Called between frames, so
+    /// the only state to put back is what `begin_frame` does not reset.
     fn render_offscreen(
         &mut self,
-        _handle: BitmapHandle,
-        _commands: CommandList,
+        handle: BitmapHandle,
+        commands: CommandList,
         _quality: StageQuality,
-        _bounds: PixelRegion,
+        bounds: PixelRegion,
     ) -> Option<Box<dyn SyncHandle>> {
-        None
+        let data = as_registry_data(&handle);
+        let (width, height) = (data.width as i32, data.height as i32);
+        let target = match self.bind_texture_framebuffer(data, true) {
+            Ok(target) => target,
+            Err(e) => {
+                log::error!("BitmapData.draw: {e}");
+                self.gl.bind_framebuffer(Gl::FRAMEBUFFER, None);
+                return None;
+            }
+        };
+
+        let saved_view_matrix = self.view_matrix;
+        let saved_size = (self.renderbuffer_width, self.renderbuffer_height);
+        let saved_blend_modes = std::mem::take(&mut self.blend_modes);
+
+        self.view_matrix = [
+            [2.0 / width as f32, 0.0, 0.0, 0.0],
+            [0.0, 2.0 / height as f32, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [-1.0, -1.0, 0.0, 1.0],
+        ];
+        self.renderbuffer_width = width;
+        self.renderbuffer_height = height;
+        self.reset_draw_state();
+        self.apply_blend_mode(RenderBlendMode::Builtin(BlendMode::Normal));
+
+        self.gl.viewport(0, 0, width, height);
+        self.set_stencil_state();
+        self.gl.stencil_mask(0xff);
+        self.gl.clear(Gl::STENCIL_BUFFER_BIT);
+
+        commands.execute(self);
+
+        // Back to what the next `begin_frame` expects.
+        self.gl.disable(Gl::STENCIL_TEST);
+        self.gl.color_mask(true, true, true, true);
+        drop(target);
+        self.view_matrix = saved_view_matrix;
+        (self.renderbuffer_width, self.renderbuffer_height) = saved_size;
+        self.gl.viewport(0, 0, saved_size.0, saved_size.1);
+        self.blend_modes = saved_blend_modes;
+        let blend = self
+            .blend_modes
+            .last()
+            .cloned()
+            .unwrap_or(RenderBlendMode::Builtin(BlendMode::Normal));
+        self.apply_blend_mode(blend);
+        self.reset_draw_state();
+
+        Some(Box::new(OffscreenSyncHandle { handle, bounds }))
     }
 
     fn viewport_dimensions(&self) -> ViewportDimensions {
@@ -1212,14 +1370,45 @@ impl RenderBackend for WebGlRenderBackend {
         ))
     }
 
+    /// Reads a `render_offscreen` result back for the CPU: the `bounds` rows,
+    /// top first, 4 bytes per pixel, premultiplied like the texture.
     fn resolve_sync_handle(
         &mut self,
-        _handle: Box<dyn SyncHandle>,
-        _with_rgba: RgbaBufRead,
+        handle: Box<dyn SyncHandle>,
+        with_rgba: RgbaBufRead,
     ) -> Result<(), ruffle_render::error::Error> {
-        Err(ruffle_render::error::Error::Unimplemented(
-            "Sync handle resolution".into(),
-        ))
+        let Ok(sync) = <Box<dyn Any>>::downcast::<OffscreenSyncHandle>(handle) else {
+            return Err(ruffle_render::error::Error::Unimplemented(
+                "Foreign sync handle".into(),
+            ));
+        };
+        let data = as_registry_data(&sync.handle);
+        let mut bounds = sync.bounds;
+        bounds.clamp(data.width, data.height);
+        let (width, height) = (bounds.width(), bounds.height());
+        let mut pixels = vec![0u8; (width * height * 4) as usize];
+
+        if width > 0 && height > 0 {
+            let target = self
+                .bind_texture_framebuffer(data, false)
+                .map_err(|e| ruffle_render::error::Error::Unimplemented(e.to_string().into()))?;
+            let result = self.gl.read_pixels_with_opt_u8_array(
+                bounds.x_min as i32,
+                bounds.y_min as i32,
+                width as i32,
+                height as i32,
+                Gl::RGBA,
+                Gl::UNSIGNED_BYTE,
+                Some(&mut pixels),
+            );
+            drop(target);
+            if let Err(e) = result {
+                log::error!("BitmapData readback failed: {e:?}");
+            }
+        }
+
+        with_rgba(&pixels, width * 4);
+        Ok(())
     }
 
     fn run_pixelbender_shader(
