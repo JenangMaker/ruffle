@@ -974,7 +974,17 @@ pub fn draw<'gc>(
         ) {
             Ok(()) => {}
             Err(BitmapDataDrawError::Unimplemented) => {
-                return Err("Render backend does not support BitmapData.draw".into());
+                // Flash Player never throws here. Returning an error instead
+                // unwinds out of the calling script: AdventureQuest Worlds
+                // calls draw() while setting up a room, and on the webgl
+                // backend the abort left players and the HUD uninitialised.
+                // Leave the bitmap untouched and let the script carry on.
+                avm2_stub_method!(
+                    activation,
+                    "flash.display.BitmapData",
+                    "draw",
+                    "with a render backend that cannot render offscreen"
+                );
             }
         };
     }
@@ -1050,7 +1060,13 @@ pub fn draw_with_quality<'gc>(
         ) {
             Ok(()) => {}
             Err(BitmapDataDrawError::Unimplemented) => {
-                return Err("Render backend does not support BitmapData.draw".into());
+                // See `draw`: don't abort the caller's script.
+                avm2_stub_method!(
+                    activation,
+                    "flash.display.BitmapData",
+                    "drawWithQuality",
+                    "with a render backend that cannot render offscreen"
+                );
             }
         };
     }
