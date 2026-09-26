@@ -28,6 +28,7 @@ use fnv::FnvHashMap;
 use gc_arena::lock::GcRefLock;
 use gc_arena::{Collect, Gc, Mutation};
 use ruffle_wstr::WStr;
+use std::cell::Cell;
 use std::sync::Arc;
 use swf::DoAbc2Flag;
 use swf::avm2::read::Reader;
@@ -103,7 +104,7 @@ pub use crate::avm2::qname::QName;
 pub use crate::avm2::value::Value;
 
 use self::api_version::ApiVersion;
-use self::object::WeakObject;
+use self::object::{DictionaryObject, DictionaryObjectWeak, WeakObject};
 use self::scope::Scope;
 
 const BROADCAST_WHITELIST: [&[u8]; 4] =
@@ -171,6 +172,15 @@ pub struct Avm2<'gc> {
     /// currently present on the display list. This list keeps track of that.
     broadcast_list: FnvHashMap<AvmString<'gc>, Vec<WeakObject<'gc>>>,
 
+    /// Every live `new Dictionary(true)`, for `finalize_weak_dictionaries`.
+    /// Behind a lock because finalization only gets a shared reference.
+    weak_dictionaries: GcRefLock<'gc, Vec<DictionaryObjectWeak<'gc>>>,
+
+    /// Set by `System.gc()`; the player runs a full collection after the
+    /// current update.
+    #[collect(require_static)]
+    full_gc_requested: Cell<bool>,
+
     alias_to_class_map: FnvHashMap<AvmString<'gc>, ClassObject<'gc>>,
     class_to_alias_map: FnvHashMap<Class<'gc>, AvmString<'gc>>,
 
@@ -227,6 +237,8 @@ impl<'gc> Avm2<'gc> {
             native_custom_constructor_table: Default::default(),
             native_fast_call_list: Default::default(),
             broadcast_list: Default::default(),
+            weak_dictionaries: GcRefLock::new(mc, Vec::new().into()),
+            full_gc_requested: Cell::new(false),
 
             alias_to_class_map: Default::default(),
             class_to_alias_map: Default::default(),
@@ -242,6 +254,54 @@ impl<'gc> Avm2<'gc> {
 
             optimizer_enabled: true,
         }
+    }
+
+    pub fn request_full_gc(&self) {
+        self.full_gc_requested.set(true);
+    }
+
+    /// Returns and clears the `System.gc()` request.
+    pub fn take_full_gc_request(&self) -> bool {
+        self.full_gc_requested.replace(false)
+    }
+
+    pub fn register_weak_dictionary(
+        &self,
+        mc: &Mutation<'gc>,
+        dictionary: DictionaryObjectWeak<'gc>,
+    ) {
+        self.weak_dictionaries.borrow_mut(mc).push(dictionary);
+    }
+
+    /// Weak-keyed `Dictionary` support, run on the fully marked heap before
+    /// anything is swept. Such dictionaries do not trace their object-keyed
+    /// entries (see `ScriptObjectData::trace_with_weak_object_keys`); here an
+    /// entry's object value is resurrected if its key is alive. That can bring
+    /// other keys to life, so while anything is resurrected this returns
+    /// `true` and must be called again after marking resumes. Once nothing
+    /// changes, entries with dead keys are removed and it returns `false`:
+    /// the heap may then be swept.
+    pub fn finalize_weak_dictionaries(&self, fc: &gc_arena::Finalization<'gc>) -> bool {
+        let dictionaries: Vec<DictionaryObject<'gc>> = {
+            let mut list = self.weak_dictionaries.borrow_mut(fc);
+            // Drop dead dictionaries now, before the sweep frees them.
+            list.retain(|d| !d.0.is_dead(fc));
+            list.iter()
+                .filter_map(|d| d.0.upgrade(fc).map(DictionaryObject))
+                .collect()
+        };
+
+        let mut resurrected = false;
+        for dictionary in &dictionaries {
+            resurrected |= dictionary.resurrect_values_of_live_keys(fc);
+        }
+        if resurrected {
+            return true;
+        }
+        for dictionary in &dictionaries {
+            dictionary.remove_dead_keys(fc);
+        }
+        false
     }
 
     pub fn load_player_globals(context: &mut UpdateContext<'gc>) {

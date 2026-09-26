@@ -9,6 +9,18 @@ use crate::avm2::value::Value;
 use crate::avm2_stub_method;
 use ruffle_common::sandbox::SandboxType;
 
+/// Implements `flash.system.System.gc`: the collector cannot run while script
+/// is executing, so this requests a full collection at the end of the
+/// current player update (see `Player::collect_garbage`).
+pub fn gc<'gc>(
+    activation: &mut Activation<'_, 'gc>,
+    _this: Value<'gc>,
+    _args: FunctionArgs<'_, 'gc>,
+) -> Result<Value<'gc>, Error<'gc>> {
+    activation.avm2().request_full_gc();
+    Ok(Value::Undefined)
+}
+
 /// Implements `flash.system.System.setClipboard` method
 pub fn set_clipboard<'gc>(
     activation: &mut Activation<'_, 'gc>,

@@ -1,0 +1,3 @@
+before: weak [a,anchor,b,cycle,dropped,kept,linked,str], strong 1
+after gc: weak [anchor,kept,linked,str], strong 1
+anchor value is linked: true

@@ -56,6 +56,8 @@ impl ScriptObjectHandle {
 /// Host implementations of `TObject` should embed `ScriptObjectData` and
 /// forward any trait method implementations it does not overwrite to this
 /// struct.
+///
+/// When adding a field, also trace it in `trace_with_weak_object_keys`.
 #[derive(Clone, Collect)]
 #[collect(no_drop)]
 #[repr(align(8))]
@@ -82,6 +84,34 @@ pub struct ScriptObjectData<'gc> {
 impl<'gc> TObject<'gc> for ScriptObject<'gc> {
     fn gc_base(&self) -> Gc<'gc, ScriptObjectData<'gc>> {
         self.0
+    }
+}
+
+impl<'gc> ScriptObjectData<'gc> {
+    /// Traces like the derived `Collect`, except for dynamic entries keyed by
+    /// an object: their key is not traced, nor is their value when it is an
+    /// object. A weak-keyed `Dictionary` traces itself this way, and
+    /// `Avm2::finalize_weak_dictionaries` then keeps a value alive exactly
+    /// while its key is (ephemeron semantics).
+    pub fn trace_with_weak_object_keys<C: gc_arena::collect::Trace<'gc>>(&self, cc: &mut C) {
+        for (key, property) in self.values.borrow().iter() {
+            match key {
+                DynamicKey::Object(_) => {
+                    if !matches!(property.value, Value::Object(_)) {
+                        cc.trace(&property.value);
+                    }
+                }
+                _ => {
+                    cc.trace(key);
+                    cc.trace(&property.value);
+                }
+            }
+        }
+        cc.trace(&self.slots);
+        cc.trace(&self.bound_methods);
+        cc.trace(&self.proto);
+        cc.trace(&self.instance_class);
+        cc.trace(&self.vtable);
     }
 }
 
