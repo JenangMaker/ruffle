@@ -2447,7 +2447,7 @@ impl Player {
 
     /// Pays the GC's allocation debt. Unlike a plain `collect_debt`, marking
     /// stops once the heap is fully marked so that weak-keyed Dictionaries can
-    /// be finalized (`Avm2::finalize_weak_dictionaries`) before the sweep;
+    /// be finalized (`Player::finalize_weak_references`) before the sweep;
     /// if that resurrects anything, marking resumes on a later call.
     fn collect_garbage(arena: &mut GcArena) {
         let full = arena.mutate(|_, root| root.data.borrow().avm2.take_full_gc_request());
@@ -2462,8 +2462,7 @@ impl Player {
         if arena.collection_phase() == CollectionPhase::Sweeping {
             arena.cycle_debt();
         } else if let Some(marked) = arena.mark_debt() {
-            let resurrected =
-                marked.finalize(|fc, root| root.data.borrow().avm2.finalize_weak_dictionaries(fc));
+            let resurrected = marked.finalize(|fc, root| Self::finalize_weak_references(fc, root));
             if !resurrected {
                 arena.cycle_debt();
             }
@@ -2491,24 +2490,60 @@ impl Player {
                 .into_iter()
                 .map(|(url, (count, bytes))| serde_json::json!({ "url": url, "count": count, "bytes": bytes }))
                 .collect();
+            let summary = context.library.last_gc_summary();
+            let kept: serde_json::Map<String, serde_json::Value> = summary
+                .kept
+                .iter()
+                .map(|(reason, (count, examples))| {
+                    (reason.to_string(), serde_json::json!({ "count": count, "examples": examples }))
+                })
+                .collect();
+            let last_gc_libraries = serde_json::json!({
+                "collectable": summary.collectable,
+                "dropped": summary.dropped,
+                "kept": kept,
+            });
             serde_json::json!({
                 "gcObjects": gc_objects,
                 "movies": movie_list,
                 "orphans": context.orphan_manager.len(),
                 "weakDictionaries": context.avm2.weak_dictionary_count(),
+                "lastGcLibraries": last_gc_libraries,
             })
             .to_string()
         })
     }
 
+    /// Everything that holds GC pointers weakly and must be settled on the
+    /// fully marked heap before the sweep: weak-keyed Dictionaries and the
+    /// libraries of loaded movies. First what is still in use gets
+    /// resurrected; if anything was, returns `true` (marking resumes, then
+    /// this runs again). Only once nothing is do they drop what is dead.
+    fn finalize_weak_references<'gc>(
+        fc: &'gc gc_arena::Finalization<'gc>,
+        root: &'gc GcRoot<'gc>,
+    ) -> bool {
+        let resurrected = {
+            let data = root.data.borrow();
+            // `|`, not `||`: both must see this pass.
+            data.avm2.resurrect_weak_dictionary_values(fc)
+                | data.library.resurrect_movie_libraries_in_use(fc)
+        };
+        if !resurrected {
+            let mut data = root.data.borrow_mut(fc);
+            data.avm2.prune_weak_dictionaries(fc);
+            data.library.drop_unused_movie_libraries(fc);
+        }
+        resurrected
+    }
+
     /// Runs the current collection cycle to the end (starting one if the
-    /// collector is asleep), finalizing weak-keyed Dictionaries before the
-    /// sweep.
+    /// collector is asleep), finalizing weak references before the sweep.
     fn finish_gc_cycle(arena: &mut GcArena) {
         if arena.collection_phase() != CollectionPhase::Sweeping {
             while let Some(marked) = arena.finish_marking() {
-                let resurrected = marked
-                    .finalize(|fc, root| root.data.borrow().avm2.finalize_weak_dictionaries(fc));
+                let resurrected =
+                    marked.finalize(|fc, root| Self::finalize_weak_references(fc, root));
                 if !resurrected {
                     break;
                 }

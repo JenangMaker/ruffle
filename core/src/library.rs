@@ -3,13 +3,13 @@ use crate::avm2::{Class as Avm2Class, Domain as Avm2Domain};
 use crate::backend::audio::SoundHandle;
 use crate::character::Character;
 
-use crate::display_object::{Bitmap, Graphic, MorphShape, Text};
+use crate::display_object::{Bitmap, Graphic, MorphShape, MovieClip, MovieClipWeak, Text};
 use crate::font::{Font, FontDescriptor, FontLike, FontQuery, FontType};
 use crate::prelude::*;
 use crate::string::AvmString;
 use crate::tag_utils::SwfMovie;
 use gc_arena::collect::Trace;
-use gc_arena::{Collect, Mutation};
+use gc_arena::{Collect, Finalization, Gc, GcWeak, Mutation};
 use ruffle_render::backend::RenderBackend;
 use ruffle_render::bitmap::BitmapHandle;
 use ruffle_render::utils::remove_invalid_jpeg_data;
@@ -52,12 +52,13 @@ pub struct Avm2ClassRegistry<'gc> {
     class_map: WeakValueHashMap<Avm2Class<'gc>, WeakMovieSymbol>,
 }
 
+// SAFETY: the class keys are deliberately not traced. A class is kept alive by
+// its domain and whatever uses it, not by this registry (tracing them pinned
+// every loaded movie's classes, and through them the movie, forever).
+// `prune_dead_classes` removes keys that are about to be collected before the
+// sweep; keys are otherwise only hashed and compared by pointer.
 unsafe impl<'gc> Collect<'gc> for Avm2ClassRegistry<'gc> {
-    fn trace<C: Trace<'gc>>(&self, cc: &mut C) {
-        for (k, _) in self.class_map.iter() {
-            cc.trace(k);
-        }
-    }
+    fn trace<C: Trace<'gc>>(&self, _cc: &mut C) {}
 }
 
 impl Default for Avm2ClassRegistry<'_> {
@@ -70,6 +71,29 @@ impl<'gc> Avm2ClassRegistry<'gc> {
     pub fn new() -> Self {
         Self {
             class_map: WeakValueHashMap::new(),
+        }
+    }
+
+    /// The movies that have at least one live class mapped to a symbol.
+    fn movies_with_live_classes(&self, fc: &Finalization<'gc>) -> FnvHashSet<*const SwfMovie> {
+        self.class_map
+            .iter()
+            .filter(|(class, _)| !class.is_dead(fc))
+            .map(|(_, MovieSymbol(movie, _))| Arc::as_ptr(&movie))
+            .collect()
+    }
+
+    /// Drops entries whose class is about to be collected (see `Collect`).
+    fn prune_dead_classes(&mut self, fc: &Finalization<'gc>) {
+        self.class_map.remove_expired();
+        let dead: Vec<Avm2Class<'gc>> = self
+            .class_map
+            .iter()
+            .filter(|(class, _)| class.is_dead(fc))
+            .map(|(class, _)| *class)
+            .collect();
+        for class in dead {
+            self.class_map.remove(&class);
         }
     }
 
@@ -127,6 +151,10 @@ pub struct MovieLibrary<'gc> {
     jpeg_tables: Option<Vec<u8>>,
     fonts: FontMap<'gc>,
     avm2_domain: Option<Avm2Domain<'gc>>,
+
+    /// Root clips of this movie as loaded by a `Loader` (held weakly). Having
+    /// one makes the library collectable; see `add_root_anchor`.
+    root_anchors: Vec<MovieClipWeak<'gc>>,
 }
 
 impl<'gc> MovieLibrary<'gc> {
@@ -139,6 +167,62 @@ impl<'gc> MovieLibrary<'gc> {
             jpeg_tables: None,
             fonts: Default::default(),
             avm2_domain: None,
+            root_anchors: Vec::new(),
+        }
+    }
+
+    /// Registers the root clip of an AS3 movie loaded by a `Loader`. From then
+    /// on the library is freed once nothing made from the movie is alive (see
+    /// `Library::resurrect_movie_libraries_in_use`), where it used to be kept
+    /// for the whole session. Libraries without an anchor (the main movie,
+    /// AVM1 movies, internal ones) are still kept for good.
+    pub fn add_root_anchor(&mut self, root: MovieClip<'gc>) {
+        self.root_anchors.push(root.downgrade());
+    }
+
+    fn collectable(&self) -> bool {
+        !self.root_anchors.is_empty() && self.swf.is_action_script_3()
+    }
+
+    /// Whether anything that may still need this library is alive: its root
+    /// clip, a class mapped to one of its symbols, or anything made from one
+    /// of its characters.
+    ///
+    /// Its application domain deliberately does not count: code can only get
+    /// at the library's symbols through a class mapped to them (covered
+    /// above), and a domain is often shared - AQW loads every piece of player
+    /// gear into one - so counting it kept every such movie alive for good.
+    fn in_use(
+        &self,
+        fc: &Finalization<'gc>,
+        movies_with_live_classes: &FnvHashSet<*const SwfMovie>,
+    ) -> bool {
+        self.keep_reason(fc, movies_with_live_classes).is_some()
+    }
+
+    /// What keeps this library in use, if anything (see `in_use`): every
+    /// live signal, joined with `+`.
+    fn keep_reason(
+        &self,
+        fc: &Finalization<'gc>,
+        movies_with_live_classes: &FnvHashSet<*const SwfMovie>,
+    ) -> Option<&'static str> {
+        let root = self.root_anchors.iter().any(|root| !root.is_dead(fc));
+        let class = movies_with_live_classes.contains(&Arc::as_ptr(&self.swf));
+        let character = self.characters.values().any(|character| {
+            character
+                .liveness_handle()
+                .is_some_and(|gc| !Gc::is_dead(fc, gc))
+        });
+        match (root, class, character) {
+            (false, false, false) => None,
+            (true, false, false) => Some("root"),
+            (false, true, false) => Some("class"),
+            (false, false, true) => Some("character"),
+            (true, true, false) => Some("root+class"),
+            (true, false, true) => Some("root+character"),
+            (false, true, true) => Some("class+character"),
+            (true, true, true) => Some("root+class+character"),
         }
     }
 
@@ -402,13 +486,37 @@ impl ruffle_render::bitmap::BitmapSource for MovieLibrarySource<'_, '_> {
 
 struct MovieLibraries<'gc>(PtrWeakKeyHashMap<Weak<SwfMovie>, MovieLibrary<'gc>>);
 
+// SAFETY: collectable libraries (loaded AS3 movies with a root anchor) are
+// not traced here. Before every sweep, `Library::resurrect_movie_libraries_in_use`
+// resurrects everything such a library references if it is still in use,
+// and `Library::drop_unused_movie_libraries` removes the rest.
 unsafe impl<'gc> Collect<'gc> for MovieLibraries<'gc> {
     #[inline]
     fn trace<C: Trace<'gc>>(&self, cc: &mut C) {
         for (_, val) in self.0.iter() {
-            cc.trace(val);
+            if !val.collectable() {
+                cc.trace(val);
+            }
         }
     }
+}
+
+/// A `Trace` that resurrects every pointer it is given which is currently
+/// unmarked, used to keep a whole in-use library alive during finalization.
+struct Resurrector<'a, 'gc> {
+    fc: &'a Finalization<'gc>,
+    resurrected: bool,
+}
+
+impl<'gc> Trace<'gc> for Resurrector<'_, 'gc> {
+    fn trace_gc(&mut self, gc: Gc<'gc, ()>) {
+        if Gc::is_dead(self.fc, gc) {
+            Gc::resurrect(self.fc, gc);
+            self.resurrected = true;
+        }
+    }
+
+    fn trace_gc_weak(&mut self, _gc: GcWeak<'gc, ()>) {}
 }
 
 impl<'gc> MovieLibraries<'gc> {
@@ -462,6 +570,19 @@ pub struct Library<'gc> {
     /// A list of the symbols associated with specific AVM2 constructor
     /// prototypes.
     avm2_class_registry: Avm2ClassRegistry<'gc>,
+
+    /// For `Player::debug_stats`.
+    #[collect(require_static)]
+    last_gc_summary: LibraryGcSummary,
+}
+
+/// What one collection decided about the collectable movie libraries: how
+/// many were dropped, and why the others were kept (with example URLs).
+#[derive(Default, Debug, Clone)]
+pub struct LibraryGcSummary {
+    pub collectable: usize,
+    pub dropped: usize,
+    pub kept: std::collections::BTreeMap<&'static str, (usize, Vec<String>)>,
 }
 
 impl<'gc> Library<'gc> {
@@ -475,6 +596,7 @@ impl<'gc> Library<'gc> {
             default_font_names: Default::default(),
             default_font_cache: Default::default(),
             avm2_class_registry: Default::default(),
+            last_gc_summary: Default::default(),
         }
     }
 
@@ -488,6 +610,61 @@ impl<'gc> Library<'gc> {
 
     pub fn known_movies(&self) -> impl Iterator<Item = Arc<SwfMovie>> {
         self.movie_libraries.known_movies()
+    }
+
+    /// Finalization, on the fully marked heap: resurrects every collectable
+    /// library that is still in use (see `MovieLibrary::in_use`). Returns
+    /// whether anything was newly resurrected, in which case marking must
+    /// resume and finalization run again, since that can bring other
+    /// libraries back into use.
+    pub fn resurrect_movie_libraries_in_use(&self, fc: &Finalization<'gc>) -> bool {
+        let live_classes = self.avm2_class_registry.movies_with_live_classes(fc);
+        let mut resurrector = Resurrector {
+            fc,
+            resurrected: false,
+        };
+        for (_, library) in self.movie_libraries.0.iter() {
+            if library.collectable() && library.in_use(fc, &live_classes) {
+                library.trace(&mut resurrector);
+            }
+        }
+        resurrector.resurrected
+    }
+
+    /// Last finalization pass, once nothing more is resurrected: frees the
+    /// collectable libraries nobody uses (their movie and everything built
+    /// from it), and drops class registry entries about to be collected.
+    pub fn drop_unused_movie_libraries(&mut self, fc: &Finalization<'gc>) {
+        let live_classes = self.avm2_class_registry.movies_with_live_classes(fc);
+        let mut summary = LibraryGcSummary::default();
+        let mut unused: Vec<Arc<SwfMovie>> = Vec::new();
+        for (movie, library) in self.movie_libraries.0.iter() {
+            if !library.collectable() {
+                continue;
+            }
+            summary.collectable += 1;
+            match library.keep_reason(fc, &live_classes) {
+                Some(reason) => {
+                    let entry = summary.kept.entry(reason).or_default();
+                    entry.0 += 1;
+                    if entry.1.len() < 3 {
+                        entry.1.push(movie.url().to_string());
+                    }
+                }
+                None => unused.push(movie),
+            }
+        }
+        summary.dropped = unused.len();
+        for movie in &unused {
+            self.movie_libraries.0.remove(movie);
+        }
+        self.avm2_class_registry.prune_dead_classes(fc);
+        self.last_gc_summary = summary;
+    }
+
+    /// What the last collection decided about loaded movies' libraries.
+    pub fn last_gc_summary(&self) -> &LibraryGcSummary {
+        &self.last_gc_summary
     }
 
     /// Returns the default Font implementations behind the built in names (ie `_sans`)

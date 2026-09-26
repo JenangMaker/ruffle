@@ -144,6 +144,11 @@ impl<'gc> MovieClipWeak<'gc> {
         self.0.upgrade(mc).map(MovieClip)
     }
 
+    /// Whether the clip is unreachable at the start of this finalization pass.
+    pub fn is_dead(self, fc: &gc_arena::Finalization<'gc>) -> bool {
+        self.0.is_dead(fc)
+    }
+
     pub fn as_ptr(self) -> *const DisplayObjectPtr {
         self.0.as_ptr() as *const DisplayObjectPtr
     }
@@ -364,6 +369,12 @@ impl<'gc> MovieClip<'gc> {
 
     pub fn instantiate(self, mc: &Mutation<'gc>) -> Self {
         Self(Gc::new(mc, (*self.0).clone()))
+    }
+
+    /// The data this clip shares with every instance made from it; see
+    /// `Character::liveness_handle`.
+    pub fn shared_gc(self) -> Gc<'gc, ()> {
+        Gc::erase(self.0.shared.get())
     }
 
     /// Replace the current MovieClipData with a completely new SwfMovie.

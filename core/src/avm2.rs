@@ -277,35 +277,45 @@ impl<'gc> Avm2<'gc> {
         self.weak_dictionaries.borrow_mut(mc).push(dictionary);
     }
 
+    /// The live weak-keyed dictionaries (those not about to be collected).
+    fn live_weak_dictionaries(
+        &self,
+        fc: &gc_arena::Finalization<'gc>,
+    ) -> Vec<DictionaryObject<'gc>> {
+        self.weak_dictionaries
+            .borrow()
+            .iter()
+            .filter(|d| !d.0.is_dead(fc))
+            .filter_map(|d| d.0.upgrade(fc).map(DictionaryObject))
+            .collect()
+    }
+
     /// Weak-keyed `Dictionary` support, run on the fully marked heap before
     /// anything is swept. Such dictionaries do not trace their object-keyed
     /// entries (see `ScriptObjectData::trace_with_weak_object_keys`); here an
     /// entry's object value is resurrected if its key is alive. That can bring
-    /// other keys to life, so while anything is resurrected this returns
-    /// `true` and must be called again after marking resumes. Once nothing
-    /// changes, entries with dead keys are removed and it returns `false`:
-    /// the heap may then be swept.
-    pub fn finalize_weak_dictionaries(&self, fc: &gc_arena::Finalization<'gc>) -> bool {
-        let dictionaries: Vec<DictionaryObject<'gc>> = {
-            let mut list = self.weak_dictionaries.borrow_mut(fc);
-            // Drop dead dictionaries now, before the sweep frees them.
-            list.retain(|d| !d.0.is_dead(fc));
-            list.iter()
-                .filter_map(|d| d.0.upgrade(fc).map(DictionaryObject))
-                .collect()
-        };
-
+    /// other keys to life, so this returns whether anything was resurrected,
+    /// and while it is, marking must resume and this be called again. Once
+    /// nothing is (here or elsewhere), call `prune_weak_dictionaries`.
+    pub fn resurrect_weak_dictionary_values(&self, fc: &gc_arena::Finalization<'gc>) -> bool {
         let mut resurrected = false;
-        for dictionary in &dictionaries {
+        for dictionary in self.live_weak_dictionaries(fc) {
             resurrected |= dictionary.resurrect_values_of_live_keys(fc);
         }
-        if resurrected {
-            return true;
-        }
-        for dictionary in &dictionaries {
+        resurrected
+    }
+
+    /// Last finalization pass: removes entries whose key is about to be
+    /// collected, and forgets dictionaries that are. Only valid once nothing
+    /// more is being resurrected, since until then a dead-looking dictionary
+    /// or key may still come back.
+    pub fn prune_weak_dictionaries(&self, fc: &gc_arena::Finalization<'gc>) {
+        for dictionary in self.live_weak_dictionaries(fc) {
             dictionary.remove_dead_keys(fc);
         }
-        false
+        self.weak_dictionaries
+            .borrow_mut(fc)
+            .retain(|d| !d.0.is_dead(fc));
     }
 
     pub fn load_player_globals(context: &mut UpdateContext<'gc>) {
