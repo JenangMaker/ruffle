@@ -957,6 +957,22 @@ macro_rules! define_weak_enum {
                     $( Self::$variant(o) => $strong_enum::$variant($variant(o.0.upgrade(mc)?)).into(), )*
                 }
             }
+
+            /// Whether the object is unreachable at the start of this
+            /// finalization pass (see `GcWeak::is_dead`).
+            $vis fn is_dead(self, fc: &gc_arena::Finalization<'gc>) -> bool {
+                match self {
+                    $( Self::$variant(o) => o.0.is_dead(fc), )*
+                }
+            }
+
+            /// Keeps the object, and everything it references, alive for
+            /// this collection cycle (see `GcWeak::resurrect`).
+            $vis fn resurrect(self, fc: &gc_arena::Finalization<'gc>) {
+                match self {
+                    $( Self::$variant(o) => { o.0.resurrect(fc); } )*
+                }
+            }
         }
 
         impl<'gc> $strong_enum<'gc> {

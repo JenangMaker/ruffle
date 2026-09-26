@@ -61,6 +61,7 @@ use crate::vminterface::Instantiator;
 use async_channel::Sender;
 use enumset::EnumSet;
 use fnv::FnvHashSet;
+use gc_arena::arena::CollectionPhase;
 use gc_arena::lock::GcRefLock;
 use gc_arena::{Collect, DynamicRootSet, Mutation, Rootable};
 use ruffle_common::duration::FloatDuration;
@@ -2439,10 +2440,50 @@ impl Player {
         });
         self.update_mouse_state(EnumSet::empty(), false, &mut false);
 
-        // GC
-        self.gc_arena.borrow_mut().collect_debt();
+        Self::collect_garbage(&mut self.gc_arena.borrow_mut());
 
         rval
+    }
+
+    /// Pays the GC's allocation debt. Unlike a plain `collect_debt`, marking
+    /// stops once the heap is fully marked so that weak-keyed Dictionaries can
+    /// be finalized (`Avm2::finalize_weak_dictionaries`) before the sweep;
+    /// if that resurrects anything, marking resumes on a later call.
+    fn collect_garbage(arena: &mut GcArena) {
+        let full = arena.mutate(|_, root| root.data.borrow().avm2.take_full_gc_request());
+        if full {
+            // System.gc(): finish the cycle in progress (it may have marked
+            // things before they became garbage), then run a whole fresh one.
+            Self::finish_gc_cycle(arena);
+            Self::finish_gc_cycle(arena);
+            return;
+        }
+
+        if arena.collection_phase() == CollectionPhase::Sweeping {
+            arena.cycle_debt();
+        } else if let Some(marked) = arena.mark_debt() {
+            let resurrected =
+                marked.finalize(|fc, root| root.data.borrow().avm2.finalize_weak_dictionaries(fc));
+            if !resurrected {
+                arena.cycle_debt();
+            }
+        }
+    }
+
+    /// Runs the current collection cycle to the end (starting one if the
+    /// collector is asleep), finalizing weak-keyed Dictionaries before the
+    /// sweep.
+    fn finish_gc_cycle(arena: &mut GcArena) {
+        if arena.collection_phase() != CollectionPhase::Sweeping {
+            while let Some(marked) = arena.finish_marking() {
+                let resurrected = marked
+                    .finalize(|fc, root| root.data.borrow().avm2.finalize_weak_dictionaries(fc));
+                if !resurrected {
+                    break;
+                }
+            }
+        }
+        arena.finish_cycle();
     }
 
     pub fn flush_shared_objects(&mut self) {
