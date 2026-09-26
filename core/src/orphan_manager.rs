@@ -42,6 +42,15 @@ impl<'gc> OrphanManager<'gc> {
         }
     }
 
+    /// Number of entries on the orphan list (some may already be dead).
+    pub fn len(&self) -> usize {
+        self.orphans.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.orphans.is_empty()
+    }
+
     pub fn each_orphan_obj(
         context: &mut UpdateContext<'gc>,
         mut f: impl FnMut(DisplayObject<'gc>, &mut UpdateContext<'gc>),

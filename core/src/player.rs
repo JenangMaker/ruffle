@@ -2470,6 +2470,37 @@ impl Player {
         }
     }
 
+    /// A snapshot for hunting memory leaks, as JSON: live GC objects, the SWF
+    /// movies still alive (grouped by URL without its query string, with
+    /// counts and total bytes), the orphaned-clip list and weak-keyed
+    /// Dictionaries. A movie stays alive as long as anything references it,
+    /// so a map or asset that keeps appearing here after it was replaced has
+    /// leaked.
+    pub fn debug_stats(&mut self) -> String {
+        let gc_objects = self.gc_arena.borrow().metrics().total_gc_count();
+        self.mutate_with_update_context(|context| {
+            let mut movies: std::collections::BTreeMap<String, (usize, usize)> = Default::default();
+            for movie in context.library.known_movies() {
+                let url = movie.url();
+                let key = url.split('?').next().unwrap_or(url).to_string();
+                let entry = movies.entry(key).or_default();
+                entry.0 += 1;
+                entry.1 += movie.data().len();
+            }
+            let movie_list: Vec<serde_json::Value> = movies
+                .into_iter()
+                .map(|(url, (count, bytes))| serde_json::json!({ "url": url, "count": count, "bytes": bytes }))
+                .collect();
+            serde_json::json!({
+                "gcObjects": gc_objects,
+                "movies": movie_list,
+                "orphans": context.orphan_manager.len(),
+                "weakDictionaries": context.avm2.weak_dictionary_count(),
+            })
+            .to_string()
+        })
+    }
+
     /// Runs the current collection cycle to the end (starting one if the
     /// collector is asleep), finalizing weak-keyed Dictionaries before the
     /// sweep.

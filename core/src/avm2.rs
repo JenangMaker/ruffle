@@ -256,6 +256,10 @@ impl<'gc> Avm2<'gc> {
         }
     }
 
+    pub fn weak_dictionary_count(&self) -> usize {
+        self.weak_dictionaries.borrow().len()
+    }
+
     pub fn request_full_gc(&self) {
         self.full_gc_requested.set(true);
     }
