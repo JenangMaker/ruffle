@@ -407,6 +407,12 @@ impl RuffleHandle {
         });
     }
 
+    /// Memory snapshot for leak hunting, as JSON; see `Player::debug_stats`.
+    pub fn debug_stats(&self) -> String {
+        self.with_core_mut(|core| core.debug_stats())
+            .unwrap_or_default()
+    }
+
     pub fn render_scale(&self) -> f64 {
         self.with_instance(|instance| instance.render_scale)
             .unwrap_or(1.0)

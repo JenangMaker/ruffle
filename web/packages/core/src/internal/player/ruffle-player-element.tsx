@@ -135,6 +135,10 @@ export class RufflePlayerElement extends HTMLElement implements PlayerElement {
         this.#inner.maxRenderFps = value;
     }
 
+    debugStats(): unknown {
+        return this.#inner.debugStats();
+    }
+
     get renderScale(): number {
         return this.#inner.renderScale;
     }

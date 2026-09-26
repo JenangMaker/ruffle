@@ -1093,6 +1093,19 @@ export class InnerPlayer {
     }
 
     /**
+     * Memory snapshot for leak hunting: live GC objects, the SWF movies
+     * still alive (by URL), orphaned clips and weak-keyed Dictionaries.
+     *
+     * @returns The snapshot, or null before the player has started.
+     */
+    debugStats(): unknown {
+        if (this.instance) {
+            return JSON.parse(this.instance.debug_stats());
+        }
+        return null;
+    }
+
+    /**
      * The fraction of display resolution the stage is rendered at.
      *
      * @returns The render scale, 1.0 by default.
