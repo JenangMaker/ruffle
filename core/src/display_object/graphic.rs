@@ -25,6 +25,14 @@ use std::sync::Arc;
 #[collect(no_drop)]
 pub struct Graphic<'gc>(Gc<'gc, GraphicData<'gc>>);
 
+impl<'gc> Graphic<'gc> {
+    /// The data this graphic shares with every instance made from it; see
+    /// `Character::liveness_handle`.
+    pub fn shared_gc(self) -> Gc<'gc, ()> {
+        Gc::erase(self.0.shared.get())
+    }
+}
+
 impl fmt::Debug for Graphic<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Graphic")

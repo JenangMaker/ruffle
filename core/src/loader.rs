@@ -1902,6 +1902,16 @@ impl<'gc> MovieLoader<'gc> {
 
                     mc.replace_with_movie(uc, Some(movie.clone()), true, loader_info);
 
+                    // Let the movie's library be freed once nothing from it
+                    // is in use, rather than living as long as the player.
+                    if movie.is_action_script_3()
+                        && matches!(vm_data, MovieLoaderVMData::Avm2 { .. })
+                    {
+                        uc.library
+                            .library_for_movie_mut(movie.clone())
+                            .add_root_anchor(mc);
+                    }
+
                     // Update the MovieClip's script object prototype to match the new movie's version.
                     // This is needed because the level clip may have been created by a loader with
                     // a different SWF version, and its script object was set up with the wrong prototype.

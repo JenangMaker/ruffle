@@ -34,6 +34,14 @@ use std::sync::Arc;
 #[collect(no_drop)]
 pub struct Avm2Button<'gc>(Gc<'gc, Avm2ButtonData<'gc>>);
 
+impl<'gc> Avm2Button<'gc> {
+    /// The data this button shares with every instance made from it; see
+    /// `Character::liveness_handle`.
+    pub fn shared_gc(self) -> Gc<'gc, ()> {
+        Gc::erase(self.0.shared)
+    }
+}
+
 impl fmt::Debug for Avm2Button<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Avm2Button")

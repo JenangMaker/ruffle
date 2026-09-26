@@ -321,6 +321,11 @@ struct FontData {
 }
 
 impl<'gc> Font<'gc> {
+    /// The font's GC pointer, for liveness checks during finalization.
+    pub fn erased_gc(self) -> Gc<'gc, ()> {
+        Gc::erase(self.0)
+    }
+
     pub fn from_font_file(
         gc_context: &Mutation<'gc>,
         descriptor: FontDescriptor,

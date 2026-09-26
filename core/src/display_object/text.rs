@@ -21,6 +21,14 @@ use std::sync::Arc;
 #[collect(no_drop)]
 pub struct Text<'gc>(Gc<'gc, TextData<'gc>>);
 
+impl<'gc> Text<'gc> {
+    /// The data this text shares with every instance made from it; see
+    /// `Character::liveness_handle`.
+    pub fn shared_gc(self) -> Gc<'gc, ()> {
+        Gc::erase(self.0.shared.get())
+    }
+}
+
 impl fmt::Debug for Text<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Text")

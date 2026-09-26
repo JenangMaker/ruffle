@@ -74,6 +74,14 @@ pub enum AutoSizeMode {
 #[collect(no_drop)]
 pub struct EditText<'gc>(Gc<'gc, EditTextData<'gc>>);
 
+impl<'gc> EditText<'gc> {
+    /// The data this text field shares with every instance made from it; see
+    /// `Character::liveness_handle`.
+    pub fn shared_gc(self) -> Gc<'gc, ()> {
+        Gc::erase(self.0.shared)
+    }
+}
+
 impl fmt::Debug for EditText<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("EditText")

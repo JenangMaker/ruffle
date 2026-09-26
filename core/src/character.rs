@@ -31,6 +31,30 @@ pub enum Character<'gc> {
     BinaryData(Gc<'gc, BinaryData>),
 }
 
+impl<'gc> Character<'gc> {
+    /// A GC pointer that stays reachable, from outside the library, for as
+    /// long as anything made from this character is alive: display objects
+    /// are clones of the library's prototype that share its `shared` data,
+    /// and fonts and binary data are referenced directly. `None` for kinds
+    /// whose users do not need the library afterwards (sounds, videos).
+    /// Used to decide whether a loaded movie's library is still in use.
+    pub fn liveness_handle(&self) -> Option<Gc<'gc, ()>> {
+        match self {
+            Character::EditText(c) => Some(c.shared_gc()),
+            Character::Graphic(c) => Some(c.shared_gc()),
+            Character::MovieClip(c) => Some(c.shared_gc()),
+            Character::Bitmap(c) => Some(Gc::erase(*c)),
+            Character::Avm1Button(c) => Some(c.shared_gc()),
+            Character::Avm2Button(c) => Some(c.shared_gc()),
+            Character::Font(c) => Some(c.erased_gc()),
+            Character::MorphShape(c) => Some(c.shared_gc()),
+            Character::Text(c) => Some(c.shared_gc()),
+            Character::Sound(_) | Character::Video(_) => None,
+            Character::BinaryData(c) => Some(Gc::erase(*c)),
+        }
+    }
+}
+
 #[derive(Collect, Debug)]
 #[collect(no_drop)]
 pub struct BitmapCharacter<'gc> {
