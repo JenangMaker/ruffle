@@ -155,6 +155,16 @@ struct BitmapData {
 
 impl BitmapHandleImpl for BitmapData {}
 
+/// Result of `render_offscreen`: the pixels are already on the bitmap's
+/// canvas; resolving reads `bounds` back with `getImageData`.
+#[derive(Debug)]
+struct OffscreenSyncHandle {
+    handle: BitmapHandle,
+    bounds: PixelRegion,
+}
+
+impl SyncHandle for OffscreenSyncHandle {}
+
 fn as_bitmap_data(handle: &BitmapHandle) -> &BitmapData {
     <dyn Any>::downcast_ref(&*handle.0).expect("Bitmap handle must be a Canvas BitmapData")
 }
@@ -504,14 +514,36 @@ impl RenderBackend for WebCanvasRenderBackend {
         ShapeHandle(Arc::new(ShapeData(data)))
     }
 
+    /// `BitmapData.draw`: runs the commands on the bitmap's own canvas, over
+    /// its existing pixels. AQW draws its map backgrounds this way (unless
+    /// Smooth Background is on), and the skill cooldown overlay; without this
+    /// they stayed blank. The drawing state is swapped to the bitmap's
+    /// context for the duration and put back afterwards.
     fn render_offscreen(
         &mut self,
-        _handle: BitmapHandle,
-        _commands: CommandList,
+        handle: BitmapHandle,
+        commands: CommandList,
         _quality: StageQuality,
-        _bounds: PixelRegion,
+        bounds: PixelRegion,
     ) -> Option<Box<dyn SyncHandle>> {
-        None
+        let target = as_bitmap_data(&handle).context.clone();
+        let stage_context = std::mem::replace(&mut self.context, target);
+        let stage_mask = std::mem::replace(&mut self.mask_state, MaskState::DrawContent);
+        let stage_blends = std::mem::replace(
+            &mut self.blend_modes,
+            vec![RenderBlendMode::Builtin(BlendMode::Normal)],
+        );
+
+        self.context.save();
+        self.context.reset_transform().warn_on_error();
+        let _ = self.context.set_global_composite_operation("source-over");
+        commands.execute(self);
+        self.context.restore();
+
+        self.context = stage_context;
+        self.mask_state = stage_mask;
+        self.blend_modes = stage_blends;
+        Some(Box::new(OffscreenSyncHandle { handle, bounds }))
     }
 
     fn submit_frame(
@@ -576,12 +608,46 @@ impl RenderBackend for WebCanvasRenderBackend {
         Err(Error::Unimplemented("run_pixelbender_shader".into()))
     }
 
+    /// Reads a `render_offscreen` result back for the CPU: the `bounds` rows,
+    /// top first, 4 bytes per pixel, premultiplied as Ruffle's bitmaps are
+    /// (a 2D canvas hands back straight alpha).
     fn resolve_sync_handle(
         &mut self,
-        _handle: Box<dyn SyncHandle>,
-        _with_rgba: RgbaBufRead,
+        handle: Box<dyn SyncHandle>,
+        with_rgba: RgbaBufRead,
     ) -> Result<(), Error> {
-        Err(Error::Unimplemented("Sync handle resolution".into()))
+        let Ok(sync) = <Box<dyn Any>>::downcast::<OffscreenSyncHandle>(handle) else {
+            return Err(Error::Unimplemented("Foreign sync handle".into()));
+        };
+        let data = as_bitmap_data(&sync.handle);
+        let mut bounds = sync.bounds;
+        bounds.clamp(data.canvas.width(), data.canvas.height());
+        let (width, height) = (bounds.width(), bounds.height());
+        let mut pixels = vec![0u8; (width * height * 4) as usize];
+
+        if width > 0 && height > 0 {
+            match data.context.get_image_data(
+                bounds.x_min as i32,
+                bounds.y_min as i32,
+                width as i32,
+                height as i32,
+            ) {
+                Ok(image) => {
+                    let straight = image.data();
+                    for (out, px) in pixels.chunks_exact_mut(4).zip(straight.chunks_exact(4)) {
+                        let a = px[3] as u16;
+                        out[0] = ((px[0] as u16 * a + 127) / 255) as u8;
+                        out[1] = ((px[1] as u16 * a + 127) / 255) as u8;
+                        out[2] = ((px[2] as u16 * a + 127) / 255) as u8;
+                        out[3] = px[3];
+                    }
+                }
+                Err(e) => log::error!("BitmapData readback failed: {e:?}"),
+            }
+        }
+
+        with_rgba(&pixels, width * 4);
+        Ok(())
     }
 
     fn create_empty_texture(
