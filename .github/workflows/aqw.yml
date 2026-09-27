@@ -1,0 +1,171 @@
+# Builds the AQW-patched Ruffle on GitHub Actions and publishes its
+# self-hosted web package, the Ruffle VibeSkua's Docker image uses.
+#
+# This fork's branches run only this workflow: Ruffle's own workflows (full
+# test matrix, fuzzing, nightly releases, translations, extension builds)
+# are removed from the aqw-* branches, and with an aqw-* branch as the fork's
+# default branch none of their schedules run either. The Gitea copy of this
+# build is .gitea/workflows/aqw.yml.
+#
+# Jobs:
+#   test     the Loader regression tests this fork adds, plus the rest of
+#            avm2/loader*, so a Ruffle update that breaks them is caught.
+#   web      builds the self-hosted web package (a run artifact too).
+#   release  publishes it as a GitHub Release asset:
+#              push to aqw-loader-fixes -> release "aqw-latest" (replaced
+#                each time, marked pre-release):
+#                .../releases/download/aqw-latest/ruffle-aqw-selfhosted.zip
+#              tag aqw-*                -> a release of that name, kept.
+#            Other aqw-* branches only build (artifact, no release).
+
+name: AQW build
+
+on:
+  push:
+    branches: ["aqw-**"]
+    tags: ["aqw-*"]
+  workflow_dispatch:
+
+concurrency:
+  group: aqw-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+  # Keep in step with Cargo.lock; checked below.
+  WASM_BINDGEN_VERSION: "0.2.127"
+  BINARYEN_VERSION: "133"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    container:
+      image: node:22-bookworm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Java and Rust
+        run: |
+          set -eu
+          apt-get update
+          # Java compiles Ruffle's playerglobal ActionScript at build time.
+          apt-get install -y --no-install-recommends default-jre-headless
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: aqw-test-${{ hashFiles('Cargo.lock') }}
+
+      - name: Loader regression tests
+        run: cargo test -p tests --test tests -- avm2/loader
+
+  web:
+    runs-on: ubuntu-latest
+    container:
+      image: node:22-bookworm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          set -eu
+          apt-get update
+          apt-get install -y --no-install-recommends default-jre-headless zip
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+          . "$HOME/.cargo/env"
+          rustup target add wasm32-unknown-unknown
+
+          # wasm-bindgen-cli must match the wasm-bindgen crate exactly.
+          LOCKED=$(grep -A1 '^name = "wasm-bindgen"$' Cargo.lock | sed -n 's/^version = "\(.*\)"/\1/p')
+          if [ "$LOCKED" != "$WASM_BINDGEN_VERSION" ]; then
+            echo "Cargo.lock wants wasm-bindgen $LOCKED but WASM_BINDGEN_VERSION is $WASM_BINDGEN_VERSION"
+            exit 1
+          fi
+          mkdir -p "$HOME/tools"
+          curl -sSL "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/${LOCKED}/wasm-bindgen-${LOCKED}-x86_64-unknown-linux-musl.tar.gz" \
+            | tar -xz -C "$HOME/tools" --strip-components=1
+          curl -sSL "https://github.com/WebAssembly/binaryen/releases/download/version_${BINARYEN_VERSION}/binaryen-version_${BINARYEN_VERSION}-x86_64-linux.tar.gz" \
+            | tar -xz -C "$HOME/tools" --strip-components=2 "binaryen-version_${BINARYEN_VERSION}/bin"
+
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          echo "$HOME/tools" >> "$GITHUB_PATH"
+
+      - name: Report versions
+        run: |
+          rustc --version
+          wasm-bindgen --version
+          wasm-opt --version
+          java -version 2>&1 | head -1
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: aqw-web-${{ hashFiles('Cargo.lock') }}
+
+      - name: Build self-hosted web package
+        working-directory: web
+        run: |
+          set -eu
+          npm ci --no-audit --no-fund
+          npm run build --workspace=ruffle-core
+          npm run build --workspace=ruffle-selfhosted
+          ls -la packages/selfhosted/dist
+
+      - name: Package
+        run: |
+          set -eu
+          cd web/packages/selfhosted/dist
+          zip -qr "$GITHUB_WORKSPACE/ruffle-aqw-selfhosted.zip" .
+          ls -la "$GITHUB_WORKSPACE/ruffle-aqw-selfhosted.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ruffle-aqw-selfhosted
+          path: ruffle-aqw-selfhosted.zip
+          retention-days: 30
+
+  release:
+    needs: [test, web]
+    if: github.ref == 'refs/heads/aqw-loader-fixes' || startsWith(github.ref, 'refs/tags/aqw-')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ruffle-aqw-selfhosted
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -eu
+          FILE=ruffle-aqw-selfhosted.zip
+          SHORT=$(echo "$GITHUB_SHA" | cut -c1-8)
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            gh release create "$GITHUB_REF_NAME" "$FILE" \
+              --title "AQW Ruffle $GITHUB_REF_NAME" \
+              --notes "Self-hosted web build of Ruffle with the AQW fixes, from $GITHUB_SHA."
+            echo "https://github.com/$GH_REPO/releases/download/$GITHUB_REF_NAME/$FILE"
+          else
+            # A stable URL for the newest build: replace the release (and move
+            # its tag to this commit).
+            gh release delete aqw-latest --cleanup-tag --yes 2>/dev/null || true
+            gh release create aqw-latest "$FILE" --target "$GITHUB_SHA" --prerelease \
+              --title "AQW Ruffle (latest, $SHORT)" \
+              --notes "Newest self-hosted web build of Ruffle with the AQW fixes, from $GITHUB_REF_NAME at $GITHUB_SHA. Replaced on every push; tag aqw-* for a kept release."
+            echo "https://github.com/$GH_REPO/releases/download/aqw-latest/$FILE"
+          fi
