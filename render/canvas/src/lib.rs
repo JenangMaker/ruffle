@@ -1302,14 +1302,14 @@ fn swf_to_canvas_gradient(
                 // Add the colors forward.
                 for stop in &color_stops {
                     canvas_gradient
-                        .add_color_stop(t + stop.0 * step, &stop.1)
+                        .add_color_stop((t + stop.0 * step).min(1.0), &stop.1)
                         .warn_on_error();
                 }
                 t += step;
                 // Add the colors backward.
                 for stop in color_stops.iter().rev() {
                     canvas_gradient
-                        .add_color_stop(t + (1.0 - stop.0) * step, &stop.1)
+                        .add_color_stop((t + (1.0 - stop.0) * step).min(1.0), &stop.1)
                         .warn_on_error();
                 }
                 t += step;
@@ -1326,11 +1326,11 @@ fn swf_to_canvas_gradient(
                         .warn_on_error();
                     for stop in &color_stops {
                         canvas_gradient
-                            .add_color_stop(t + stop.0 * step, &stop.1)
+                            .add_color_stop((t + stop.0 * step).min(1.0), &stop.1)
                             .warn_on_error();
                     }
                     canvas_gradient
-                        .add_color_stop(t + step, &last_stop.1)
+                        .add_color_stop((t + step).min(1.0), &last_stop.1)
                         .warn_on_error();
                     t += step;
                 }
