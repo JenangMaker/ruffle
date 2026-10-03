@@ -2617,6 +2617,13 @@ impl Player {
         });
     }
 
+    /// Whether the movie has registered an ExternalInterface callback by this name.
+    pub fn has_internal_interface(&mut self, name: &str) -> bool {
+        self.mutate_with_update_context(|context| {
+            context.external_interface.get_callback(name).is_some()
+        })
+    }
+
     pub fn call_internal_interface(
         &mut self,
         name: &str,
