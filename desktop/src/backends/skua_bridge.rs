@@ -46,6 +46,25 @@ static DRAWING_PAUSED: AtomicBool = AtomicBool::new(false);
 static RENDER_CAP_FPS: AtomicU32 = AtomicU32::new(0);
 static LAST_RENDER: Mutex<Option<Instant>> = Mutex::new(None);
 
+/// The player window's X11 id, for Skua to embed it (page.windowId), as
+/// main.js's /game-window gave the Electron window's.
+static WINDOW_ID: OnceLock<u64> = OnceLock::new();
+
+pub fn set_window(window: &winit::window::Window) {
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let id = match window.window_handle().map(|h| h.as_raw()) {
+        Ok(RawWindowHandle::Xlib(h)) => Some(h.window as u64),
+        Ok(RawWindowHandle::Xcb(h)) => Some(h.window.get() as u64),
+        _ => None,
+    };
+    match id {
+        Some(id) => {
+            let _ = WINDOW_ID.set(id);
+        }
+        None => tracing::warn!("skua bridge: not an X11 window; Skua cannot embed it"),
+    }
+}
+
 /// Whether drawing is paused: the window then asks for no redraws at all.
 pub fn drawing_paused() -> bool {
     DRAWING_PAUSED.load(Ordering::Relaxed)
@@ -222,11 +241,20 @@ fn run(
             tracing::info!("skua bridge disconnected ({why}); retrying");
         }
     };
+    // Skua started this player; if Skua goes away without ending it (killed outright),
+    // the player is re-parented and nothing drives it any more: exit.
+    // SAFETY: getppid has no preconditions.
+    let parent = unsafe { libc::getppid() };
     let would_block = |e: &tungstenite::Error| matches!(e, tungstenite::Error::Io(e) if e.kind() == ErrorKind::WouldBlock);
     loop {
         // Clear the wake-ups; the channel holds the messages.
         let mut buf = [0u8; 64];
         while matches!(wake.read(&mut buf), Ok(n) if n > 0) {}
+
+        if socket.is_none() && unsafe { libc::getppid() } != parent {
+            tracing::info!("skua bridge: Skua is gone (the player was re-parented); exiting");
+            std::process::exit(0);
+        }
 
         // Replies and events since the last pass.
         loop {
@@ -457,6 +485,9 @@ fn page_call(name: &str, args: &[ExternalValue]) -> Result<Json, String> {
             }
             Ok(Json::Bool(true))
         }
+        "windowId" => Ok(WINDOW_ID
+            .get()
+            .map_or(Json::Null, |id| json!(id.to_string()))),
         "getRender" => {
             let cap = RENDER_CAP_FPS.load(Ordering::Relaxed);
             let fps = if DRAWING_PAUSED.load(Ordering::Relaxed) {
