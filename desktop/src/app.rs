@@ -391,7 +391,12 @@ impl MainWindow {
         if matches!(self.loaded, LoadingState::Loaded) {
             let new_time = Instant::now();
             let dt = FloatDuration::from_std(new_time.duration_since(self.time));
-            if dt.as_millis() > 0.0 {
+            // VibeSkua: every event ends in this tick, and Skua's bridge calls
+            // are events (200+ a second in a fight): tick when a frame or timer
+            // is due, else at most every 16 ms, as the browser's animation
+            // frames do. A call itself still runs at once (SkuaBridgeCall).
+            let due = self.next_frame_time.is_none_or(|t| new_time >= t) || dt.as_millis() >= 16.0;
+            if dt.as_millis() > 0.0 && due {
                 self.time = new_time;
                 self.next_frame_time = self.player.get().map(|mut player| {
                     player.tick(dt);
