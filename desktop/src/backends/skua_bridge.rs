@@ -399,6 +399,15 @@ pub fn handle_call(player: &mut Player, text: &str) {
         Some(Json::Array(args)) => args.iter().map(from_json).collect(),
         _ => Vec::new(),
     };
+    // A paused (hidden or headless) window has no pointer over it. Ruffle runs a mouse
+    // pick (a hit test of the whole display tree) after every call into the movie
+    // while it thinks the pointer is over the stage, and only a pointer leaving the
+    // window tells it otherwise: a window parked under a resting pointer made every
+    // call cost a pick (14 ms in Battleon on a software renderer).
+    if name == "page.pauseDrawing" && matches!(args.first(), Some(ExternalValue::Bool(true))) {
+        player.set_mouse_in_stage(false);
+        player.handle_event(ruffle_core::events::PlayerEvent::MouseLeave);
+    }
     let result = match name.strip_prefix("page.") {
         Some(page) => page_call(page, &args),
         None if player.has_internal_interface(name) => {
