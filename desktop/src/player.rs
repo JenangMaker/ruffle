@@ -355,6 +355,7 @@ impl ActivePlayer {
                 .lock()
                 .expect("Player lock must be available")
                 .set_external_interface_provider(Some(Box::new(provider)));
+            crate::backends::skua_bridge::set_window(&window);
         }
 
         window.set_title(&format!("Ruffle - {readable_name}"));
