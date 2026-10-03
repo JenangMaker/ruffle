@@ -1,6 +1,7 @@
 mod external_interface;
 mod fscommand;
 mod navigator;
+pub mod skua_bridge;
 mod ui;
 
 pub use external_interface::DesktopExternalInterfaceProvider;

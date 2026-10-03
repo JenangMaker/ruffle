@@ -51,7 +51,8 @@ impl MainWindow {
             // Don't render when nobody can see the result: while minimized, the
             // surface also keeps the size it had before, as `GuiController::resize`
             // refuses to reconfigure it to a zero size.
-            if !self.minimized && !self.occluded {
+            // VibeSkua: hidden and headless tabs draw nothing (backends/skua_bridge.rs).
+            if !self.minimized && !self.occluded && crate::backends::skua_bridge::may_render() {
                 let mut player = self.player.get();
                 if let Some(ref mut player) = player {
                     // Even if the movie is paused, user interaction with debug tools can change the render output
@@ -402,6 +403,10 @@ impl MainWindow {
     }
 
     fn check_redraw(&self) {
+        // VibeSkua: nothing to draw while paused; asking anyway spins the loop.
+        if crate::backends::skua_bridge::drawing_paused() {
+            return;
+        }
         let player = self.player.get();
         if player.map(|p| p.needs_render()).unwrap_or_default() || self.gui.needs_render() {
             self.gui.window().request_redraw();
@@ -667,6 +672,12 @@ impl ApplicationHandler<RuffleEvent> for App {
                     PlayerNotification::ImeNotification(ImeNotification::ImeNotReady) => {
                         main_window.gui.set_ime_allowed(false);
                     }
+                }
+            }
+
+            (Some(main_window), RuffleEvent::SkuaBridgeCall(text)) => {
+                if let Some(mut player) = main_window.player.get() {
+                    crate::backends::skua_bridge::handle_call(&mut player, &text);
                 }
             }
 

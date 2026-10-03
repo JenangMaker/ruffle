@@ -339,6 +339,24 @@ impl ActivePlayer {
             .with_avm2_optimizer_enabled(opt.avm2_optimizer_enabled);
         let player = builder.build();
 
+        // VibeSkua: Skua drives skua.swf over a WebSocket (backends/skua_bridge.rs).
+        if let Some(url) = std::env::var("SKUA_BRIDGE_URL")
+            .ok()
+            .filter(|u| !u.is_empty())
+        {
+            let provider = crate::backends::skua_bridge::start(
+                url,
+                event_loop.clone(),
+                DesktopExternalInterfaceProvider {
+                    spoof_url: opt.player.spoof_url.clone(),
+                },
+            );
+            player
+                .lock()
+                .expect("Player lock must be available")
+                .set_external_interface_provider(Some(Box::new(provider)));
+        }
+
         window.set_title(&format!("Ruffle - {readable_name}"));
 
         SWF_INFO.with(|i| *i.borrow_mut() = Some(readable_name));

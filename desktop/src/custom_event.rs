@@ -48,4 +48,7 @@ pub enum RuffleEvent {
 
     /// Export Ruffle Bundle from currently playing content and open save dialog.
     ExportBundle,
+
+    /// VibeSkua: a call from Skua to run against the player (backends/skua_bridge.rs).
+    SkuaBridgeCall(String),
 }
