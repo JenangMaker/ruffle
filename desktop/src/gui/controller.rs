@@ -97,8 +97,7 @@ impl GuiController {
         tracing::info!("Using surface format {:?}", surface_format);
         let available = surface.get_capabilities(&adapter).present_modes;
         let chosen = match requested_present_mode() {
-            // Unset: Mailbox where offered, else no vsync.
-            None if available.contains(&wgpu::PresentMode::Mailbox) => wgpu::PresentMode::Mailbox,
+            // Unset: no vsync (Immediate where offered).
             None => wgpu::PresentMode::AutoNoVsync,
             Some(mode) if mode == wgpu::PresentMode::AutoNoVsync || available.contains(&mode) => {
                 mode
@@ -821,14 +820,13 @@ fn mmap_system_font(path: &Path) -> anyhow::Result<memmap2::Mmap> {
     Ok(mmap)
 }
 
-/// VibeSkua: how frames are presented. By default Mailbox where the surface
-/// offers it, else no vsync; RUFFLE_PRESENT picks one: mailbox, immediate, fifo
-/// or auto (no vsync), a mode not offered falling back to auto. Under KasmVNC
-/// presenting was most of a drawn frame's time (14-21 ms of 19-32 ms on the
-/// server) and, with no vsync (Immediate there), Mesa does that work on the
-/// calling thread, the one Skua's calls run on: 12-20 pictures a second.
-/// Mailbox hands frames to Mesa's presentation thread: 0.1 ms on the main
-/// thread, up to the game's own frame rate.
+/// VibeSkua: how frames are presented. By default no vsync (Immediate where
+/// offered); RUFFLE_PRESENT picks one: auto (the default), immediate, mailbox or
+/// fifo, a mode not offered falling back to auto. Measured on the server
+/// (KasmVNC, Intel GPU, a tab drawing at the game's ~27 pictures a second while
+/// farming): Immediate cost the player 69% of a core and KasmVNC 8%; Mailbox,
+/// which hands frames to Mesa's presentation thread, 85% and 53%, with an
+/// overhead a lower picture rate did not remove.
 fn requested_present_mode() -> Option<wgpu::PresentMode> {
     match std::env::var("RUFFLE_PRESENT")
         .unwrap_or_default()

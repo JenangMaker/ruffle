@@ -322,6 +322,15 @@ pub fn start(
     event_loop: EventLoopProxy<RuffleEvent>,
     fallback: DesktopExternalInterfaceProvider,
 ) -> SkuaBridgeProvider {
+    // RUFFLE_MAX_FPS (1-60): a starting cap on the pictures drawn a second,
+    // until Skua sets another (page.setRender). Unset, one per game frame.
+    if let Some(fps) = std::env::var("RUFFLE_MAX_FPS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|fps| (1..=60).contains(fps))
+    {
+        RENDER_CAP_FPS.store(fps, Ordering::Relaxed);
+    }
     let (tx, rx) = mpsc::channel();
     let (wake_tx, wake_rx) =
         UnixStream::pair().expect("could not create the Skua bridge wake-up pipe");
