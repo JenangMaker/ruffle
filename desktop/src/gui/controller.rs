@@ -518,7 +518,11 @@ impl GuiController {
 
         self.window.pre_present_notify();
         let present_started = std::time::Instant::now();
+        let present_cpu = crate::backends::skua_bridge::thread_cpu_time();
         self.descriptors.queue.present(surface_texture);
+        crate::backends::skua_bridge::note_present_cpu(
+            crate::backends::skua_bridge::thread_cpu_time().saturating_sub(present_cpu),
+        );
         crate::backends::skua_bridge::note_stage(
             crate::backends::skua_bridge::Stage::Present,
             present_started.elapsed(),
