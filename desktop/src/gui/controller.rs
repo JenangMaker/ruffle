@@ -95,6 +95,20 @@ impl GuiController {
                     .expect("At least one format should be supported")
             });
         tracing::info!("Using surface format {:?}", surface_format);
+        let available = surface.get_capabilities(&adapter).present_modes;
+        let wanted = requested_present_mode();
+        let chosen = if wanted == wgpu::PresentMode::AutoNoVsync || available.contains(&wanted) {
+            wanted
+        } else {
+            wgpu::PresentMode::AutoNoVsync
+        };
+        let _ = PRESENT_MODE.set(chosen);
+        tracing::info!(
+            "Present modes available: {:?}; asked for {:?}, using {:?}",
+            available,
+            wanted,
+            chosen
+        );
         let size = window.inner_size();
         surface.configure(
             &device,
@@ -104,10 +118,7 @@ impl GuiController {
                 color_space: wgpu::SurfaceColorSpace::Auto,
                 width: size.width,
                 height: size.height,
-                // VibeSkua: no vsync. FIFO waits for the display on every frame,
-                // and Skua's calls run on the same thread (under Xvnc there is
-                // no real display to wait for).
-                present_mode: wgpu::PresentMode::AutoNoVsync,
+                present_mode: present_mode(),
                 desired_maximum_frame_latency: 2,
                 alpha_mode: Default::default(),
                 view_formats: Default::default(),
@@ -218,10 +229,7 @@ impl GuiController {
                 color_space: wgpu::SurfaceColorSpace::Auto,
                 width: self.size.width,
                 height: self.size.height,
-                // VibeSkua: no vsync. FIFO waits for the display on every frame,
-                // and Skua's calls run on the same thread (under Xvnc there is
-                // no real display to wait for).
-                present_mode: wgpu::PresentMode::AutoNoVsync,
+                present_mode: present_mode(),
                 desired_maximum_frame_latency: 2,
                 alpha_mode: Default::default(),
                 view_formats: Default::default(),
@@ -806,4 +814,32 @@ fn mmap_system_font(path: &Path) -> anyhow::Result<memmap2::Mmap> {
 
     let mmap = mmap.map_err(|e| anyhow!("Failed to mmap font file at {path:?}: {e}"))?;
     Ok(mmap)
+}
+
+/// VibeSkua: how frames are presented, from RUFFLE_PRESENT: fifo, mailbox,
+/// immediate, or auto (no vsync, the default); a mode the surface does not offer
+/// falls back to auto. FIFO waits for the display on every frame, on the thread
+/// Skua's calls run on; under KasmVNC presenting was most of a drawn frame's
+/// time (14-21 ms of 19-32 ms on the server). Mailbox hands frames to a
+/// presentation thread instead.
+fn requested_present_mode() -> wgpu::PresentMode {
+    match std::env::var("RUFFLE_PRESENT")
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "fifo" => wgpu::PresentMode::Fifo,
+        "mailbox" => wgpu::PresentMode::Mailbox,
+        "immediate" => wgpu::PresentMode::Immediate,
+        _ => wgpu::PresentMode::AutoNoVsync,
+    }
+}
+
+static PRESENT_MODE: std::sync::OnceLock<wgpu::PresentMode> = std::sync::OnceLock::new();
+
+/// The mode chosen when the surface was first set up (see requested_present_mode).
+fn present_mode() -> wgpu::PresentMode {
+    *PRESENT_MODE
+        .get()
+        .unwrap_or(&wgpu::PresentMode::AutoNoVsync)
 }
