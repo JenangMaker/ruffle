@@ -45,6 +45,9 @@ const LOAD_CLIENT: &str = r#"{"id":-1,"fn":"loadClient","args":[]}"#;
 static DRAWING_PAUSED: AtomicBool = AtomicBool::new(false);
 static RENDER_CAP_FPS: AtomicU32 = AtomicU32::new(0);
 static LAST_RENDER: Mutex<Option<Instant>> = Mutex::new(None);
+/// The game's current frame rate (stage.frameRate) in hundredths of a frame a
+/// second, kept up to date by the window before each draw (see may_render).
+static GAME_FPS_CENTI: AtomicU32 = AtomicU32::new(0);
 /// How long the last frame took to draw, in microseconds (see rendered()).
 static RENDER_COST_US: AtomicU64 = AtomicU64::new(0);
 
@@ -72,26 +75,46 @@ pub fn drawing_paused() -> bool {
     DRAWING_PAUSED.load(Ordering::Relaxed)
 }
 
+/// The game's frame rate, for may_render (stage.frameRate: 24 in AQW, 30
+/// while a script runs with Skua's default FPS option).
+pub fn set_game_frame_rate(fps: f64) {
+    if fps.is_finite() && fps > 0.0 {
+        GAME_FPS_CENTI.store((fps * 100.0) as u32, Ordering::Relaxed);
+    }
+}
+
 /// Whether the window may draw a frame now (asked before each draw).
 ///
 /// Skua's calls arrive one at a time, each waiting for the last one's answer,
 /// and the event loop draws between them whenever the movie has changed: with
 /// nothing to space the frames out, every call waited for a whole frame to be
-/// drawn (0.3-0.5 s on a software renderer), so a Skua status read of ~20 calls
-/// took 9-15 s and Headless Mode, itself a few calls, timed out. A browser draws
-/// at most once per display frame. Here a frame comes at most 60 times a second
-/// (or the setRender cap), and drawing gets at most half of the main thread: after
-/// a frame that took D, the next one starts no sooner than 2*D after it.
+/// drawn, so a Skua status read of ~20 calls took 9-15 s and Headless Mode
+/// timed out. Now:
+/// - at most one picture per game frame, as Flash draws (and the original
+///   VibeSkua: 24 a second, 30 with a script running), or the setRender cap if
+///   lower; more pictures than game frames only repeat themselves;
+/// - drawing gets at most half of the main thread: after a frame that took D,
+///   the next starts no sooner than 2*D after it.
+/// A frame may start a little early (3/4 of the frame time), as the game's
+/// frames do not come exactly on time and a strict wait would skip every other.
 pub fn may_render() -> bool {
     if DRAWING_PAUSED.load(Ordering::Relaxed) {
         return false;
     }
-    let cap = RENDER_CAP_FPS.load(Ordering::Relaxed);
     let Ok(mut last) = LAST_RENDER.lock() else {
         return true;
     };
     let now = Instant::now();
-    let frame = Duration::from_secs_f64(1.0 / if cap > 0 { cap.min(60) } else { 60 } as f64);
+    let mut fps = 60.0_f64;
+    let game = GAME_FPS_CENTI.load(Ordering::Relaxed);
+    if game > 0 {
+        fps = fps.min(game as f64 / 100.0);
+    }
+    let cap = RENDER_CAP_FPS.load(Ordering::Relaxed);
+    if cap > 0 {
+        fps = fps.min(cap as f64);
+    }
+    let frame = Duration::from_secs_f64(0.75 / fps.max(1.0));
     let busy = Duration::from_micros(RENDER_COST_US.load(Ordering::Relaxed) * 2);
     if let Some(previous) = *last
         && now.duration_since(previous) < frame.max(busy)
