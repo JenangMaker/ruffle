@@ -47,6 +47,26 @@ struct MainWindow {
 
 impl MainWindow {
     pub fn window_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
+        if ruffle_core::skua_stats::input_debug() {
+            let now = ruffle_core::skua_stats::input_clock();
+            match &event {
+                WindowEvent::RedrawRequested
+                | WindowEvent::CursorMoved { .. }
+                | WindowEvent::Moved(_)
+                | WindowEvent::Resized(_) => {}
+                WindowEvent::KeyboardInput { event: key, is_synthetic, .. } => eprintln!(
+                    "[ruffle-input] {now} key {:?} {:?} code={:?} text={:?} repeat={} synthetic={} mods={:?}",
+                    key.state,
+                    key.logical_key,
+                    key.physical_key,
+                    key.text,
+                    key.repeat,
+                    is_synthetic,
+                    self.modifiers.state()
+                ),
+                other => eprintln!("[ruffle-input] {now} {other:?}"),
+            }
+        }
         if matches!(event, WindowEvent::RedrawRequested) {
             // Don't render when nobody can see the result: while minimized, the
             // surface also keeps the size it had before, as `GuiController::resize`
