@@ -841,6 +841,9 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
     }
 
     fn is_filter_supported(&self, filter: &Filter) -> bool {
+        if !offscreen_effects() {
+            return false;
+        }
         matches!(
             filter,
             Filter::BlurFilter(_)
@@ -854,7 +857,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
     }
 
     fn is_offscreen_supported(&self) -> bool {
-        true
+        offscreen_effects()
     }
 
     fn apply_filter(
@@ -1340,4 +1343,16 @@ impl ActiveFrame {
             self.submit_direct(descriptors);
         }
     }
+}
+
+/// VibeSkua: RUFFLE_FILTERS=off draws as Ruffle's browser WebGL renderer does,
+/// without filters (glows, blurs, shadows) and without the bitmap caches
+/// (cacheAsBitmap) they need. Each filtered or cached object is otherwise drawn
+/// into its own texture, again whenever it changes, and in AQW that is every
+/// animated character: frames took seconds to tens of seconds, on a GPU too.
+pub(crate) fn offscreen_effects() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !std::env::var("RUFFLE_FILTERS").is_ok_and(|v| v.eq_ignore_ascii_case("off"))
+    })
 }
