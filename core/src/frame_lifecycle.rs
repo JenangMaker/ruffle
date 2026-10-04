@@ -18,6 +18,39 @@ use crate::loader::LoadManager;
 use crate::orphan_manager::OrphanManager;
 use tracing::instrument;
 
+/// VibeSkua: counters for the desktop player's drawing summary, and the switch
+/// for skipping the work of no-op gotos (see `MovieClip::no_op_goto`).
+pub mod skua_stats {
+    use std::sync::atomic::AtomicU64;
+
+    /// No-op gotos (a goto to the clip's current frame).
+    pub static NOOP_GOTOS: AtomicU64 = AtomicU64::new(0);
+    /// Inner goto passes run (`run_inner_goto_frame`), no-op or not.
+    pub static INNER_GOTOS: AtomicU64 = AtomicU64::new(0);
+    /// Time spent in those passes, in microseconds (not in the web build).
+    pub static INNER_GOTO_US: AtomicU64 = AtomicU64::new(0);
+    /// Entries on the orphan list at the last inner goto.
+    pub static ORPHANS: AtomicU64 = AtomicU64::new(0);
+
+    /// RUFFLE_FAST_NOOP_GOTO=1: a no-op goto only clears the clip's queued goto,
+    /// without the whole-stage pass (construct, frame scripts, frame events, for
+    /// the stage and every orphan) that Flash runs and Ruffle copies. AQW's
+    /// cooldown spinners make such gotos many times a frame. Off by default:
+    /// scripts can observe the pass (frameConstructed / exitFrame events, frame
+    /// scripts queued elsewhere running at once).
+    pub fn fast_noop_goto() -> bool {
+        #[cfg(not(target_family = "wasm"))]
+        {
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *ON.get_or_init(|| std::env::var("RUFFLE_FAST_NOOP_GOTO").is_ok_and(|v| v == "1"))
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            false
+        }
+    }
+}
+
 /// Which phase of the frame we're currently in.
 ///
 /// AVM2 frames exist in one of four phases: `Enter`, `Construct`,
@@ -136,6 +169,13 @@ pub fn run_inner_goto_frame<'gc>(
 
     let stage = context.stage;
     let old_phase = *context.frame_phase;
+    #[cfg(not(target_family = "wasm"))]
+    let started = std::time::Instant::now();
+    skua_stats::INNER_GOTOS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    skua_stats::ORPHANS.store(
+        context.orphan_manager.len() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 
     // When performing goto, frame scripts behave the same as when entering a new frame
     // so no separate cleanup is performed on ones registered during frame script phase
@@ -171,6 +211,11 @@ pub fn run_inner_goto_frame<'gc>(
     context.orphan_manager.cleanup_dead_orphans(context.gc());
 
     *context.frame_phase = old_phase;
+    #[cfg(not(target_family = "wasm"))]
+    skua_stats::INNER_GOTO_US.fetch_add(
+        started.elapsed().as_micros() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 /// Broadcast a `enterFrame` event to all `DisplayObject`s.
