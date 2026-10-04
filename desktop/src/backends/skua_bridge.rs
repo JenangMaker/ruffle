@@ -291,16 +291,11 @@ pub fn rendered(cost: Duration) {
                 use std::sync::atomic::Ordering::Relaxed;
                 let secs = span.as_secs_f64();
                 tracing::warn!(
-                    "skua bridge: gotos a second: {:.0} no-op, {:.0} inner passes taking {:.0} ms a second; {} orphans{}",
+                    "skua bridge: gotos a second: {:.0} no-op, {:.0} inner passes taking {:.0} ms a second; {} orphans",
                     g::NOOP_GOTOS.swap(0, Relaxed) as f64 / secs,
                     g::INNER_GOTOS.swap(0, Relaxed) as f64 / secs,
                     g::INNER_GOTO_US.swap(0, Relaxed) as f64 / 1000.0 / secs,
                     g::ORPHANS.load(Relaxed),
-                    if g::fast_noop_goto() {
-                        " (fast no-op gotos on)"
-                    } else {
-                        ""
-                    },
                 );
             }
             *guard = None;

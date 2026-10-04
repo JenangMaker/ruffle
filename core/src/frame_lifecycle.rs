@@ -18,8 +18,8 @@ use crate::loader::LoadManager;
 use crate::orphan_manager::OrphanManager;
 use tracing::instrument;
 
-/// VibeSkua: counters for the desktop player's drawing summary, and the switch
-/// for skipping the work of no-op gotos (see `MovieClip::no_op_goto`).
+/// VibeSkua: goto counters for the desktop player's drawing summary. (Skipping
+/// the work of no-op gotos was tried and hung AQW: the game relies on it.)
 pub mod skua_stats {
     use std::sync::atomic::AtomicU64;
 
@@ -31,24 +31,6 @@ pub mod skua_stats {
     pub static INNER_GOTO_US: AtomicU64 = AtomicU64::new(0);
     /// Entries on the orphan list at the last inner goto.
     pub static ORPHANS: AtomicU64 = AtomicU64::new(0);
-
-    /// RUFFLE_FAST_NOOP_GOTO=1: a no-op goto only clears the clip's queued goto,
-    /// without the whole-stage pass (construct, frame scripts, frame events, for
-    /// the stage and every orphan) that Flash runs and Ruffle copies. AQW's
-    /// cooldown spinners make such gotos many times a frame. Off by default:
-    /// scripts can observe the pass (frameConstructed / exitFrame events, frame
-    /// scripts queued elsewhere running at once).
-    pub fn fast_noop_goto() -> bool {
-        #[cfg(not(target_family = "wasm"))]
-        {
-            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *ON.get_or_init(|| std::env::var("RUFFLE_FAST_NOOP_GOTO").is_ok_and(|v| v == "1"))
-        }
-        #[cfg(target_family = "wasm")]
-        {
-            false
-        }
-    }
 }
 
 /// Which phase of the frame we're currently in.
