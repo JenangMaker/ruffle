@@ -146,6 +146,8 @@ struct DrawStats {
     total_us: u64,
     max_us: u64,
     stage_us: [u64; 4],
+    /// CPU time the main thread itself spent presenting (see note_present_cpu).
+    present_cpu_us: u64,
 }
 
 static DRAW_STATS: Mutex<Option<DrawStats>> = Mutex::new(None);
@@ -166,8 +168,90 @@ impl DrawStats {
             total_us: 0,
             max_us: 0,
             stage_us: [0; 4],
+            present_cpu_us: 0,
         }
     }
+}
+
+/// CPU time used by the calling thread so far.
+pub fn thread_cpu_time() -> Duration {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: clock_gettime only writes the timespec it is given.
+    unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+    Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
+}
+
+/// Adds the CPU time the main thread spent presenting a frame: compared with
+/// the present stage's wall time, it tells working from waiting.
+pub fn note_present_cpu(took: Duration) {
+    if let Ok(mut guard) = DRAW_STATS.lock() {
+        guard.get_or_insert_with(DrawStats::new).present_cpu_us += took.as_micros() as u64;
+    }
+}
+
+/// Each thread's CPU time (clock ticks) at the last summary, by thread id.
+static THREAD_TICKS: Mutex<Option<std::collections::HashMap<u32, u64>>> = Mutex::new(None);
+
+/// The player's threads' CPU use since the last call, summed by thread name,
+/// busiest first, as "name 12%" (of one core over `span`).
+fn thread_cpu_summary(span: Duration) -> String {
+    let hz = (unsafe { libc::sysconf(libc::_SC_CLK_TCK) }).max(1) as f64;
+    let mut now = std::collections::HashMap::new();
+    let mut by_name: Vec<(String, u64)> = Vec::new();
+    let Ok(mut guard) = THREAD_TICKS.lock() else {
+        return String::new();
+    };
+    let before = guard.take().unwrap_or_default();
+    if let Ok(tasks) = std::fs::read_dir("/proc/self/task") {
+        for task in tasks.flatten() {
+            let Ok(tid) = task.file_name().to_string_lossy().parse::<u32>() else {
+                continue;
+            };
+            let Ok(stat) = std::fs::read_to_string(task.path().join("stat")) else {
+                continue;
+            };
+            // "tid (name) state ... utime stime ...": fields counted after the name.
+            let (Some(open), Some(close)) = (stat.find('('), stat.rfind(')')) else {
+                continue;
+            };
+            let name = stat[open + 1..close].to_string();
+            let fields: Vec<&str> = stat[close + 2..].split(' ').collect();
+            let ticks = fields
+                .get(11)
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0)
+                + fields
+                    .get(12)
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(0);
+            now.insert(tid, ticks);
+            let used = ticks.saturating_sub(*before.get(&tid).unwrap_or(&0));
+            match by_name.iter_mut().find(|(n, _)| *n == name) {
+                Some((_, sum)) => *sum += used,
+                None => by_name.push((name, used)),
+            }
+        }
+    }
+    *guard = Some(now);
+    if before.is_empty() {
+        return "(first sample)".to_string();
+    }
+    by_name.sort_by(|a, b| b.1.cmp(&a.1));
+    by_name
+        .iter()
+        .filter(|(_, used)| *used > 0)
+        .take(8)
+        .map(|(name, used)| {
+            format!(
+                "{name} {:.0}%",
+                *used as f64 / hz / span.as_secs_f64() * 100.0
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Called after each frame is drawn with how long it took (see may_render).
@@ -196,6 +280,11 @@ pub fn rendered(cost: Duration) {
                 ms(stats.stage_us[1]),
                 ms(stats.stage_us[2]),
                 ms(stats.stage_us[3]),
+            );
+            tracing::warn!(
+                "skua bridge: presenting used {:.1} ms of the main thread's CPU a frame; player threads: {}",
+                ms(stats.present_cpu_us),
+                thread_cpu_summary(span),
             );
             *guard = None;
         }
