@@ -88,12 +88,14 @@ impl<'gc> FocusTracker<'gc> {
 
     /// Set the focus programmatically.
     pub fn set(&self, new: Option<InteractiveObject<'gc>>, context: &mut UpdateContext<'gc>) {
+        crate::skua_stats::FOCUS_CAUSE.set("code");
         self.set_internal(new, context, false);
         self.update_edittext_selection();
     }
 
     /// Reset the focus programmatically.
     pub fn reset_focus(&self, context: &mut UpdateContext<'gc>) {
+        crate::skua_stats::FOCUS_CAUSE.set("reset");
         self.set_internal(None, context, true);
     }
 
@@ -122,6 +124,7 @@ impl<'gc> FocusTracker<'gc> {
         // but `None` will be used when setting the focus.
         let new = new.filter(|new| new.is_focusable_by_mouse(context));
 
+        crate::skua_stats::FOCUS_CAUSE.set("mouse");
         self.set_internal(new, context, false);
     }
 
@@ -137,6 +140,7 @@ impl<'gc> FocusTracker<'gc> {
             return;
         }
 
+        crate::skua_stats::FOCUS_CAUSE.set("key");
         self.set_internal(new, context, true);
         self.update_edittext_selection();
     }
@@ -163,6 +167,20 @@ impl<'gc> FocusTracker<'gc> {
         }
 
         let old = self.0.focus.get();
+
+        if crate::skua_stats::input_debug() && !InteractiveObject::option_ptr_eq(old, new) {
+            let name = |o: Option<InteractiveObject<'gc>>| match o {
+                Some(o) => o.as_displayobject().name().map(|n| n.to_string()).unwrap_or_else(|| "(unnamed)".into()),
+                None => "none".into(),
+            };
+            eprintln!(
+                "[ruffle-input] {} focus {} -> {} ({})",
+                crate::skua_stats::input_clock(),
+                name(old),
+                name(new),
+                crate::skua_stats::FOCUS_CAUSE.replace("?")
+            );
+        }
 
         fn handle_focus_change<'gc>(
             int: Option<InteractiveObject<'gc>>,

@@ -31,6 +31,29 @@ pub mod skua_stats {
     pub static INNER_GOTO_US: AtomicU64 = AtomicU64::new(0);
     /// Entries on the orphan list at the last inner goto.
     pub static ORPHANS: AtomicU64 = AtomicU64::new(0);
+
+    /// RUFFLE_INPUT_DEBUG=1: log, as `[ruffle-input]`, the window's input
+    /// events and each change of the focused object (typing that misbehaves
+    /// only through a VNC client).
+    pub fn input_debug() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("RUFFLE_INPUT_DEBUG").is_ok_and(|v| v == "1"))
+    }
+
+    /// The time of day (UTC) as HH:MM:SS.mmm, to line up with other logs.
+    pub fn input_clock() -> String {
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+            % 86_400_000;
+        format!("{:02}:{:02}:{:02}.{:03}", ms / 3_600_000, ms / 60_000 % 60, ms / 1000 % 60, ms % 1000)
+    }
+
+    thread_local! {
+        /// What asked for the next focus change (code, mouse, key, reset).
+        pub static FOCUS_CAUSE: std::cell::Cell<&'static str> = const { std::cell::Cell::new("?") };
+    }
 }
 
 /// Which phase of the frame we're currently in.
