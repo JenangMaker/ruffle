@@ -972,9 +972,6 @@ impl<'gc> MovieClip<'gc> {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             // Despite not running, the goto still overwrites the currently enqueued frame.
             self.0.queued_goto.set(None);
-            if crate::frame_lifecycle::skua_stats::fast_noop_goto() {
-                return;
-            }
             // Pretend we actually did a goto, but don't do anything.
             run_inner_goto_frame(context, &[], self);
         }
