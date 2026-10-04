@@ -61,16 +61,16 @@ impl<'gc> Graphic<'gc> {
         swf_shape: swf::Shape,
         movie: Arc<SwfMovie>,
     ) -> Self {
-        let library = context.library.library_for_movie(movie.clone()).unwrap();
+        // VibeSkua: not tessellated here. Drawing goes through the per-scale
+        // cache (get_or_retessellate_handle), which tessellates on first draw
+        // anyway, so a tessellation made at load was never drawn: it only held
+        // memory, for every shape of every loaded movie (about 280 MB per AQW
+        // player), and a player that never draws (headless) needs none.
         let shared = GraphicShared {
             id: swf_shape.id,
             shape_bounds: swf_shape.shape_bounds,
             edge_bounds: swf_shape.edge_bounds,
-            render_handle: Some(
-                context
-                    .renderer
-                    .register_shape((&swf_shape).into(), &MovieLibrarySource { library }),
-            ),
+            renderable: true,
             shape: swf_shape,
             movie,
             scaled_handle: RefCell::new(TessellationCache::new()),
@@ -94,7 +94,7 @@ impl<'gc> Graphic<'gc> {
             id: 0,
             shape_bounds: Default::default(),
             edge_bounds: Default::default(),
-            render_handle: None,
+            renderable: false,
             shape: swf::Shape {
                 version: 32,
                 id: 0,
@@ -139,13 +139,13 @@ impl<'gc> Graphic<'gc> {
         unlock!(Gc::write(mc, self.0), GraphicData, shared).set(shared);
     }
 
-    /// Returns the best shape handle for the current scale, retessellating if necessary.
+    /// Returns the best shape handle for the current scale, retessellating if necessary
+    /// (`None` if the movie's library is gone).
     fn get_or_retessellate_handle(
         self,
         context: &mut RenderContext,
-        base_handle: &ShapeHandle,
         current_scale: f32,
-    ) -> ShapeHandle {
+    ) -> Option<ShapeHandle> {
         // Since graphics are created from a shared shape, we may be able to reuse a
         // cached tessellation from another instance at a similar scale.
         let shared = self.0.shared.get();
@@ -154,7 +154,7 @@ impl<'gc> Graphic<'gc> {
             let mut cache = shared.scaled_handle.borrow_mut();
             if let Some(handle) = cache.find_near_and_touch(current_scale) {
                 // Found a cached handle at a similar scale; reuse it.
-                return handle;
+                return Some(handle);
             }
         }
 
@@ -178,9 +178,9 @@ impl<'gc> Graphic<'gc> {
                 cache.insert(current_scale, new_handle.clone());
             }
 
-            new_handle
+            Some(new_handle)
         } else {
-            base_handle.clone()
+            None
         }
     }
 }
@@ -263,7 +263,7 @@ impl<'gc> TDisplayObject<'gc> for Graphic<'gc> {
 
         if let Some(drawing) = self.0.drawing.get() {
             drawing.borrow().render(context);
-        } else if let Some(base_handle) = self.0.shared.get().render_handle.clone() {
+        } else if self.0.shared.get().renderable {
             let transform = context.transform_stack.transform();
 
             // Calculate the current scale from the transform, to determine if
@@ -273,9 +273,9 @@ impl<'gc> TDisplayObject<'gc> for Graphic<'gc> {
             let scale_y = f32::abs(matrix.b + matrix.d);
             let current_scale = ((scale_x * scale_x + scale_y * scale_y) / 2.0).sqrt();
 
-            let handle = self.get_or_retessellate_handle(context, &base_handle, current_scale);
-
-            context.commands.render_shape(handle, transform)
+            if let Some(handle) = self.get_or_retessellate_handle(context, current_scale) {
+                context.commands.render_shape(handle, transform)
+            }
         }
     }
 
@@ -346,7 +346,8 @@ impl<'gc> TDisplayObject<'gc> for Graphic<'gc> {
 struct GraphicShared {
     id: CharacterId,
     shape: swf::Shape,
-    render_handle: Option<ShapeHandle>,
+    /// False for the empty graphic, which draws nothing.
+    renderable: bool,
     shape_bounds: Rectangle<Twips>,
     edge_bounds: Rectangle<Twips>,
     movie: Arc<SwfMovie>,
