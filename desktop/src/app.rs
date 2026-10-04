@@ -53,6 +53,7 @@ impl MainWindow {
             // refuses to reconfigure it to a zero size.
             // VibeSkua: hidden and headless tabs draw nothing (backends/skua_bridge.rs).
             if !self.minimized && !self.occluded && crate::backends::skua_bridge::may_render() {
+                let started = Instant::now();
                 let mut player = self.player.get();
                 if let Some(ref mut player) = player {
                     // Even if the movie is paused, user interaction with debug tools can change the render output
@@ -60,6 +61,7 @@ impl MainWindow {
                 }
 
                 self.gui.render(player);
+                crate::backends::skua_bridge::rendered(started.elapsed());
             }
 
             // Important that we return here, or we'll get a feedback loop with egui

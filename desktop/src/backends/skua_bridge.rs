@@ -29,7 +29,7 @@ use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 use tungstenite::{Message, WebSocket};
@@ -45,6 +45,8 @@ const LOAD_CLIENT: &str = r#"{"id":-1,"fn":"loadClient","args":[]}"#;
 static DRAWING_PAUSED: AtomicBool = AtomicBool::new(false);
 static RENDER_CAP_FPS: AtomicU32 = AtomicU32::new(0);
 static LAST_RENDER: Mutex<Option<Instant>> = Mutex::new(None);
+/// How long the last frame took to draw, in microseconds (see rendered()).
+static RENDER_COST_US: AtomicU64 = AtomicU64::new(0);
 
 /// The player window's X11 id, for Skua to embed it (page.windowId), as
 /// main.js's /game-window gave the Electron window's.
@@ -71,6 +73,15 @@ pub fn drawing_paused() -> bool {
 }
 
 /// Whether the window may draw a frame now (asked before each draw).
+///
+/// Skua's calls arrive one at a time, each waiting for the last one's answer,
+/// and the event loop draws between them whenever the movie has changed: with
+/// nothing to space the frames out, every call waited for a whole frame to be
+/// drawn (0.3-0.5 s on a software renderer), so a Skua status read of ~20 calls
+/// took 9-15 s and Headless Mode, itself a few calls, timed out. A browser draws
+/// at most once per display frame. Here a frame comes at most 60 times a second
+/// (or the setRender cap), and drawing gets at most half of the main thread: after
+/// a frame that took D, the next one starts no sooner than 2*D after it.
 pub fn may_render() -> bool {
     if DRAWING_PAUSED.load(Ordering::Relaxed) {
         return false;
@@ -80,14 +91,23 @@ pub fn may_render() -> bool {
         return true;
     };
     let now = Instant::now();
-    if cap > 0
-        && let Some(previous) = *last
-        && now.duration_since(previous) < Duration::from_secs_f64(1.0 / cap as f64)
+    let frame = Duration::from_secs_f64(1.0 / if cap > 0 { cap.min(60) } else { 60 } as f64);
+    let busy = Duration::from_micros(RENDER_COST_US.load(Ordering::Relaxed) * 2);
+    if let Some(previous) = *last
+        && now.duration_since(previous) < frame.max(busy)
     {
         return false;
     }
     *last = Some(now);
     true
+}
+
+/// Called after each frame is drawn with how long it took (see may_render).
+pub fn rendered(cost: Duration) {
+    RENDER_COST_US.store(cost.as_micros() as u64, Ordering::Relaxed);
+    if cost >= Duration::from_millis(500) {
+        tracing::warn!("skua bridge: a frame took {} ms to draw", cost.as_millis());
+    }
 }
 
 /// Skua modules switched off or on once the game has loaded, as the page does

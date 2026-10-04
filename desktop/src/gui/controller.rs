@@ -104,7 +104,10 @@ impl GuiController {
                 color_space: wgpu::SurfaceColorSpace::Auto,
                 width: size.width,
                 height: size.height,
-                present_mode: Default::default(),
+                // VibeSkua: no vsync. FIFO waits for the display on every frame,
+                // and Skua's calls run on the same thread (under Xvnc there is
+                // no real display to wait for).
+                present_mode: wgpu::PresentMode::AutoNoVsync,
                 desired_maximum_frame_latency: 2,
                 alpha_mode: Default::default(),
                 view_formats: Default::default(),
@@ -215,7 +218,10 @@ impl GuiController {
                 color_space: wgpu::SurfaceColorSpace::Auto,
                 width: self.size.width,
                 height: self.size.height,
-                present_mode: Default::default(),
+                // VibeSkua: no vsync. FIFO waits for the display on every frame,
+                // and Skua's calls run on the same thread (under Xvnc there is
+                // no real display to wait for).
+                present_mode: wgpu::PresentMode::AutoNoVsync,
                 desired_maximum_frame_latency: 2,
                 alpha_mode: Default::default(),
                 view_formats: Default::default(),
