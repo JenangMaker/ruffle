@@ -96,15 +96,20 @@ impl GuiController {
             });
         tracing::info!("Using surface format {:?}", surface_format);
         let available = surface.get_capabilities(&adapter).present_modes;
-        let wanted = requested_present_mode();
-        let chosen = if wanted == wgpu::PresentMode::AutoNoVsync || available.contains(&wanted) {
-            wanted
-        } else {
-            wgpu::PresentMode::AutoNoVsync
+        let chosen = match requested_present_mode() {
+            // Unset: Mailbox where offered, else no vsync.
+            None if available.contains(&wgpu::PresentMode::Mailbox) => wgpu::PresentMode::Mailbox,
+            None => wgpu::PresentMode::AutoNoVsync,
+            Some(mode) if mode == wgpu::PresentMode::AutoNoVsync || available.contains(&mode) => {
+                mode
+            }
+            Some(_) => wgpu::PresentMode::AutoNoVsync,
         };
+        let wanted = requested_present_mode()
+            .map_or_else(|| "default".to_string(), |mode| format!("{mode:?}"));
         let _ = PRESENT_MODE.set(chosen);
         tracing::info!(
-            "Present modes available: {:?}; asked for {:?}, using {:?}",
+            "Present modes available: {:?}; asked for {}, using {:?}",
             available,
             wanted,
             chosen
@@ -816,22 +821,25 @@ fn mmap_system_font(path: &Path) -> anyhow::Result<memmap2::Mmap> {
     Ok(mmap)
 }
 
-/// VibeSkua: how frames are presented, from RUFFLE_PRESENT: fifo, mailbox,
-/// immediate, or auto (no vsync, the default); a mode the surface does not offer
-/// falls back to auto. FIFO waits for the display on every frame, on the thread
-/// Skua's calls run on; under KasmVNC presenting was most of a drawn frame's
-/// time (14-21 ms of 19-32 ms on the server). Mailbox hands frames to a
-/// presentation thread instead.
-fn requested_present_mode() -> wgpu::PresentMode {
+/// VibeSkua: how frames are presented. By default Mailbox where the surface
+/// offers it, else no vsync; RUFFLE_PRESENT picks one: mailbox, immediate, fifo
+/// or auto (no vsync), a mode not offered falling back to auto. Under KasmVNC
+/// presenting was most of a drawn frame's time (14-21 ms of 19-32 ms on the
+/// server) and, with no vsync (Immediate there), Mesa does that work on the
+/// calling thread, the one Skua's calls run on: 12-20 pictures a second.
+/// Mailbox hands frames to Mesa's presentation thread: 0.1 ms on the main
+/// thread, up to the game's own frame rate.
+fn requested_present_mode() -> Option<wgpu::PresentMode> {
     match std::env::var("RUFFLE_PRESENT")
         .unwrap_or_default()
         .to_ascii_lowercase()
         .as_str()
     {
-        "fifo" => wgpu::PresentMode::Fifo,
-        "mailbox" => wgpu::PresentMode::Mailbox,
-        "immediate" => wgpu::PresentMode::Immediate,
-        _ => wgpu::PresentMode::AutoNoVsync,
+        "fifo" => Some(wgpu::PresentMode::Fifo),
+        "mailbox" => Some(wgpu::PresentMode::Mailbox),
+        "immediate" => Some(wgpu::PresentMode::Immediate),
+        "auto" => Some(wgpu::PresentMode::AutoNoVsync),
+        _ => None,
     }
 }
 

@@ -52,6 +52,11 @@ impl MainWindow {
             // surface also keeps the size it had before, as `GuiController::resize`
             // refuses to reconfigure it to a zero size.
             // VibeSkua: hidden and headless tabs draw nothing (backends/skua_bridge.rs).
+            // VibeSkua: the game's frame rate paces drawing (one picture per game
+            // frame, as Flash draws).
+            if let Some(player) = self.player.get() {
+                crate::backends::skua_bridge::set_game_frame_rate(player.frame_rate());
+            }
             if !self.minimized && !self.occluded && crate::backends::skua_bridge::may_render() {
                 let started = Instant::now();
                 let mut player = self.player.get();
