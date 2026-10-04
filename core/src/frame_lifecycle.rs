@@ -51,8 +51,26 @@ pub mod skua_stats {
     }
 
     thread_local! {
-        /// What asked for the next focus change (code, mouse, key, reset).
-        pub static FOCUS_CAUSE: std::cell::Cell<&'static str> = const { std::cell::Cell::new("?") };
+        /// What asked for the next focus change (mouse, key, reset, removed,
+        /// made invisible, AS3 with its call stack, other code).
+        static FOCUS_CAUSE: std::cell::Cell<String> = const { std::cell::Cell::new(String::new()) };
+    }
+
+    pub fn set_focus_cause(cause: String) {
+        FOCUS_CAUSE.set(cause);
+    }
+
+    /// Keeps a cause already set by the caller's caller.
+    pub fn set_focus_cause_if_unset(cause: &str) {
+        FOCUS_CAUSE.with(|c| {
+            let old = c.take();
+            c.set(if old.is_empty() { cause.to_string() } else { old });
+        });
+    }
+
+    pub fn take_focus_cause() -> String {
+        let cause = FOCUS_CAUSE.take();
+        if cause.is_empty() { "?".to_string() } else { cause }
     }
 }
 

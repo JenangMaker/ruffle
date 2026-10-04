@@ -1934,6 +1934,9 @@ pub trait TDisplayObject<'gc>:
 
         if parent_removed {
             if let Some(int) = self.as_interactive() {
+                if crate::skua_stats::input_debug() && int.has_focus() {
+                    crate::skua_stats::set_focus_cause("removed from the stage".to_string());
+                }
                 int.drop_focus(context);
             }
 
@@ -2113,6 +2116,9 @@ pub trait TDisplayObject<'gc>:
 
         if !value && let Some(int) = self.as_interactive() {
             // The focus is dropped when it's made invisible.
+            if crate::skua_stats::input_debug() && int.has_focus() {
+                crate::skua_stats::set_focus_cause("made invisible".to_string());
+            }
             int.drop_focus(context);
         }
     }
