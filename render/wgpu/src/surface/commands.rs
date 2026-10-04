@@ -707,6 +707,13 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
 
 impl CommandHandler for WgpuCommandHandler<'_, '_> {
     fn blend(&mut self, commands: CommandList, blend_mode: RenderBlendMode) {
+        // VibeSkua: with RUFFLE_FILTERS=off, blended content is drawn in place
+        // (as normal), not through a fresh full-size texture per blend group.
+        if !crate::backend::offscreen_effects() {
+            let _ = blend_mode;
+            commands.execute(self);
+            return;
+        }
         let surface = Surface::new(
             self.descriptors,
             self.quality,
