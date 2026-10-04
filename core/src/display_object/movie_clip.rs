@@ -968,8 +968,13 @@ impl<'gc> MovieClip<'gc> {
     /// In AVM1, no-op gotos have no effects, so this does nothing.
     fn no_op_goto(self, context: &mut UpdateContext<'gc>) {
         if self.movie().is_action_script_3() {
+            crate::frame_lifecycle::skua_stats::NOOP_GOTOS
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             // Despite not running, the goto still overwrites the currently enqueued frame.
             self.0.queued_goto.set(None);
+            if crate::frame_lifecycle::skua_stats::fast_noop_goto() {
+                return;
+            }
             // Pretend we actually did a goto, but don't do anything.
             run_inner_goto_frame(context, &[], self);
         }

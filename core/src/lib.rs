@@ -27,6 +27,8 @@ pub mod events;
 pub mod focus_tracker;
 pub mod font;
 mod frame_lifecycle;
+/// VibeSkua: goto counters and the fast no-op goto switch (see frame_lifecycle).
+pub use frame_lifecycle::skua_stats;
 pub mod fte;
 mod html;
 mod input;
