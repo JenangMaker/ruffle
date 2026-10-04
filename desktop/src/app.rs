@@ -59,6 +59,10 @@ impl MainWindow {
                     // Even if the movie is paused, user interaction with debug tools can change the render output
                     player.render();
                 }
+                crate::backends::skua_bridge::note_stage(
+                    crate::backends::skua_bridge::Stage::Movie,
+                    started.elapsed(),
+                );
 
                 self.gui.render(player);
                 crate::backends::skua_bridge::rendered(started.elapsed());
