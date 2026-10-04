@@ -3568,9 +3568,11 @@ impl<'gc, 'a> MovieClipShared<'gc> {
         reader: &mut SwfStream<'a>,
         version: u8,
     ) -> Result<(), Error> {
+        let source = self.swf.resize_to_reader(reader);
         let swf_shape = reader.read_define_shape(version)?;
         let id = swf_shape.id;
-        let graphic = Graphic::from_swf_tag(context, swf_shape, self.movie());
+        let graphic =
+            Graphic::from_swf_tag(context, swf_shape, self.movie(), Some((source, version)));
         self.library_mut(context)
             .register_character(id, Character::Graphic(graphic));
         Ok(())

@@ -8,7 +8,7 @@ use crate::display_object::{BoundsMode, DisplayObjectBase};
 use crate::drawing::Drawing;
 use crate::library::MovieLibrarySource;
 use crate::prelude::*;
-use crate::tag_utils::SwfMovie;
+use crate::tag_utils::{SwfMovie, SwfSlice};
 use crate::tessellation_cache::TessellationCache;
 use crate::vminterface::Instantiator;
 use core::fmt;
@@ -56,10 +56,16 @@ pub struct GraphicData<'gc> {
 
 impl<'gc> Graphic<'gc> {
     /// Construct a `Graphic` from it's associated `Shape` tag.
+    ///
+    /// VibeSkua: with `source` (the tag's data and DefineShape version) the
+    /// parsed records are dropped and parsed again when first needed (to draw
+    /// or hit-test the shape): kept for every shape of every loaded movie they
+    /// took about 100 MB in an AQW player, mostly for shapes never shown.
     pub fn from_swf_tag(
         context: &mut UpdateContext<'gc>,
         swf_shape: swf::Shape,
         movie: Arc<SwfMovie>,
+        source: Option<(SwfSlice, u8)>,
     ) -> Self {
         // VibeSkua: not tessellated here. Drawing goes through the per-scale
         // cache (get_or_retessellate_handle), which tessellates on first draw
@@ -71,7 +77,12 @@ impl<'gc> Graphic<'gc> {
             shape_bounds: swf_shape.shape_bounds,
             edge_bounds: swf_shape.edge_bounds,
             renderable: true,
-            shape: swf_shape,
+            shape: if source.is_some() {
+                OnceCell::new()
+            } else {
+                OnceCell::from(swf_shape)
+            },
+            source,
             movie,
             scaled_handle: RefCell::new(TessellationCache::new()),
         };
@@ -95,18 +106,8 @@ impl<'gc> Graphic<'gc> {
             shape_bounds: Default::default(),
             edge_bounds: Default::default(),
             renderable: false,
-            shape: swf::Shape {
-                version: 32,
-                id: 0,
-                shape_bounds: Default::default(),
-                edge_bounds: Default::default(),
-                flags: swf::ShapeFlag::empty(),
-                styles: swf::ShapeStyles {
-                    fill_styles: Vec::new(),
-                    line_styles: Vec::new(),
-                },
-                shape: Vec::new(),
-            },
+            shape: OnceCell::from(empty_shape(0)),
+            source: None,
             movie: context.root_swf.clone(),
             scaled_handle: RefCell::new(TessellationCache::new()),
         };
@@ -162,7 +163,7 @@ impl<'gc> Graphic<'gc> {
         let library = context.library.library_for_movie(shared.movie.clone());
         if let Some(library) = library {
             let new_handle = context.renderer.register_shape_with_scale(
-                (&shared.shape).into(),
+                shared.shape().into(),
                 &MovieLibrarySource { library },
                 current_scale,
             );
@@ -298,8 +299,12 @@ impl<'gc> TDisplayObject<'gc> for Graphic<'gc> {
                     return true;
                 }
             } else {
-                let shape = &self.0.shared.get().shape;
-                return ruffle_render::shape_utils::shape_hit_test(shape, point, &local_matrix);
+                let shared = self.0.shared.get();
+                return ruffle_render::shape_utils::shape_hit_test(
+                    shared.shape(),
+                    point,
+                    &local_matrix,
+                );
             }
         }
 
@@ -345,7 +350,10 @@ impl<'gc> TDisplayObject<'gc> for Graphic<'gc> {
 #[collect(require_static)]
 struct GraphicShared {
     id: CharacterId,
-    shape: swf::Shape,
+    /// The shape's records; empty until first needed when `source` is set.
+    shape: OnceCell<swf::Shape>,
+    /// The DefineShape tag's data and version, to parse `shape` from.
+    source: Option<(SwfSlice, u8)>,
     /// False for the empty graphic, which draws nothing.
     renderable: bool,
     shape_bounds: Rectangle<Twips>,
@@ -353,4 +361,37 @@ struct GraphicShared {
     movie: Arc<SwfMovie>,
     #[collect(require_static)]
     scaled_handle: RefCell<TessellationCache>,
+}
+
+impl GraphicShared {
+    /// The shape's records, parsed from the tag the first time they are needed.
+    fn shape(&self) -> &swf::Shape {
+        self.shape.get_or_init(|| {
+            self.source
+                .as_ref()
+                .and_then(|(slice, version)| {
+                    slice
+                        .read_from(0)
+                        .read_define_shape(*version)
+                        .map_err(|e| tracing::warn!("Graphic {}: parsing the shape failed: {e}", self.id))
+                        .ok()
+                })
+                .unwrap_or_else(|| empty_shape(self.id))
+        })
+    }
+}
+
+fn empty_shape(id: CharacterId) -> swf::Shape {
+    swf::Shape {
+        version: 32,
+        id,
+        shape_bounds: Default::default(),
+        edge_bounds: Default::default(),
+        flags: swf::ShapeFlag::empty(),
+        styles: swf::ShapeStyles {
+            fill_styles: Vec::new(),
+            line_styles: Vec::new(),
+        },
+        shape: Vec::new(),
+    }
 }
