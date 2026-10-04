@@ -195,6 +195,10 @@ pub fn set_focus<'gc>(
     args: FunctionArgs<'_, 'gc>,
 ) -> Result<Value<'gc>, Error<'gc>> {
     let focus = activation.context.focus_tracker;
+    if crate::skua_stats::input_debug() {
+        let stack = activation.avm2().call_stack().borrow().to_string();
+        crate::skua_stats::set_focus_cause(format!("AS3 stage.focus{}", stack.replace('\n', " <")));
+    }
     match args.try_get_object(0) {
         None => focus.set(None, activation.context),
         Some(obj) => {
