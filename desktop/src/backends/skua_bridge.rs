@@ -102,9 +102,81 @@ pub fn may_render() -> bool {
     true
 }
 
+/// Parts of drawing a frame, timed for the drawing summary (see rendered).
+#[derive(Clone, Copy)]
+pub enum Stage {
+    /// The movie drawn into its offscreen texture (player.render()).
+    Movie = 0,
+    /// Getting the window's next buffer.
+    Acquire = 1,
+    /// Handing the frame's commands to the GPU.
+    Submit = 2,
+    /// Presenting the buffer to the window (the X server).
+    Present = 3,
+}
+
+/// Drawing totals since the last summary: frames, total and worst frame time,
+/// and the time per stage, in microseconds.
+struct DrawStats {
+    since: Instant,
+    frames: u64,
+    total_us: u64,
+    max_us: u64,
+    stage_us: [u64; 4],
+}
+
+static DRAW_STATS: Mutex<Option<DrawStats>> = Mutex::new(None);
+
+/// Adds the time one stage of the current frame took (see Stage).
+pub fn note_stage(stage: Stage, took: Duration) {
+    if let Ok(mut guard) = DRAW_STATS.lock() {
+        guard.get_or_insert_with(DrawStats::new).stage_us[stage as usize] +=
+            took.as_micros() as u64;
+    }
+}
+
+impl DrawStats {
+    fn new() -> Self {
+        DrawStats {
+            since: Instant::now(),
+            frames: 0,
+            total_us: 0,
+            max_us: 0,
+            stage_us: [0; 4],
+        }
+    }
+}
+
 /// Called after each frame is drawn with how long it took (see may_render).
+/// While a tab draws, logs a summary every minute: frames per second, the
+/// average and worst frame time, and where the time went.
 pub fn rendered(cost: Duration) {
     RENDER_COST_US.store(cost.as_micros() as u64, Ordering::Relaxed);
+    if let Ok(mut guard) = DRAW_STATS.lock() {
+        let stats = guard.get_or_insert_with(DrawStats::new);
+        let us = cost.as_micros() as u64;
+        stats.frames += 1;
+        stats.total_us += us;
+        stats.max_us = stats.max_us.max(us);
+        let span = stats.since.elapsed();
+        if span >= Duration::from_secs(60) {
+            let n = stats.frames.max(1) as f64;
+            let ms = |us: u64| us as f64 / 1000.0 / n;
+            tracing::warn!(
+                "skua bridge: drew {} frames in {:.0} s ({:.1} fps), {:.1} ms a frame (worst {:.0} ms): movie {:.1}, acquire {:.1}, submit {:.1}, present {:.1} ms",
+                stats.frames,
+                span.as_secs_f64(),
+                stats.frames as f64 / span.as_secs_f64(),
+                ms(stats.total_us),
+                stats.max_us as f64 / 1000.0,
+                ms(stats.stage_us[0]),
+                ms(stats.stage_us[1]),
+                ms(stats.stage_us[2]),
+                ms(stats.stage_us[3]),
+            );
+            *guard = None;
+        }
+    }
     if cost >= Duration::from_millis(500) {
         tracing::warn!("skua bridge: a frame took {} ms to draw", cost.as_millis());
     }

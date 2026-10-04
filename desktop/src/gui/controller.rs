@@ -318,7 +318,13 @@ impl GuiController {
     }
 
     pub fn render(&mut self, mut player: Option<MutexGuard<Player>>) {
-        let surface_texture = match self.surface.get_current_texture() {
+        let acquire_started = std::time::Instant::now();
+        let acquired = self.surface.get_current_texture();
+        crate::backends::skua_bridge::note_stage(
+            crate::backends::skua_bridge::Stage::Acquire,
+            acquire_started.elapsed(),
+        );
+        let surface_texture = match acquired {
             wgpu::CurrentSurfaceTexture::Success(surface_texture) => surface_texture,
             wgpu::CurrentSurfaceTexture::Suboptimal(surface_texture) => {
                 // The acquired texture is still usable - no reason to waste
@@ -484,7 +490,12 @@ impl GuiController {
         }
 
         command_buffers.push(encoder.finish());
+        let submit_started = std::time::Instant::now();
         self.descriptors.queue.submit(command_buffers);
+        crate::backends::skua_bridge::note_stage(
+            crate::backends::skua_bridge::Stage::Submit,
+            submit_started.elapsed(),
+        );
 
         // Free textures only after submitting the command buffer that may still
         // reference them.  Destroying a texture before its usage is submitted
@@ -494,7 +505,12 @@ impl GuiController {
         }
 
         self.window.pre_present_notify();
+        let present_started = std::time::Instant::now();
         self.descriptors.queue.present(surface_texture);
+        crate::backends::skua_bridge::note_stage(
+            crate::backends::skua_bridge::Stage::Present,
+            present_started.elapsed(),
+        );
         #[cfg(feature = "tracy")]
         tracing_tracy::client::frame_mark();
         #[cfg(feature = "tracy_images")]
