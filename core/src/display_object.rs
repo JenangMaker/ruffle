@@ -56,6 +56,7 @@ pub use bitmap::{Bitmap, BitmapClass};
 pub use edit_text::LayoutDebugBoxesFlag;
 pub use edit_text::{AutoSizeMode, EditText, TextSelection};
 pub use graphic::Graphic;
+pub(crate) use crate::display_object::graphic::mesh_clock_ms;
 pub use interactive::{Avm2MousePick, InteractiveObject, TInteractiveObject};
 pub use loader_display::LoaderDisplay;
 pub use morph_shape::MorphShape;

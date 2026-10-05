@@ -631,6 +631,22 @@ impl<'gc> Library<'gc> {
         resurrector.resurrected
     }
 
+    /// Drops the tessellations of every library shape not drawn in the last
+    /// `idle_ms` (see `Graphic::expire_meshes`); returns how many shapes did.
+    pub fn expire_idle_meshes(&self, now_ms: u64, idle_ms: u64) -> usize {
+        let mut expired = 0;
+        for (_, library) in self.movie_libraries.0.iter() {
+            for character in library.characters.values() {
+                if let Character::Graphic(graphic) = character
+                    && graphic.expire_meshes(now_ms, idle_ms)
+                {
+                    expired += 1;
+                }
+            }
+        }
+        expired
+    }
+
     /// Last finalization pass, once nothing more is resurrected: frees the
     /// collectable libraries nobody uses (their movie and everything built
     /// from it), and drops class registry entries about to be collected.

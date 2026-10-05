@@ -32,6 +32,16 @@ impl TessellationCache {
         }
     }
 
+    /// Drops every cached tessellation; returns whether there were any.
+    pub(crate) fn clear(&mut self) -> bool {
+        let had = self.len > 0;
+        for entry in &mut self.entries {
+            *entry = None;
+        }
+        self.len = 0;
+        had
+    }
+
     /// Finds the cached shape handle with the closest scale to the target scale.
     ///
     /// If the closest scale is NOT within the retessellation threshold,

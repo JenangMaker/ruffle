@@ -551,6 +551,20 @@ impl Player {
             return;
         }
 
+        // Every 5 s: drop the meshes of shapes not drawn for 20 s (made again
+        // when next drawn), see `Graphic::expire_meshes`.
+        {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static LAST_SWEEP_MS: AtomicU64 = AtomicU64::new(0);
+            let now = crate::display_object::mesh_clock_ms();
+            if now.saturating_sub(LAST_SWEEP_MS.load(Ordering::Relaxed)) >= 5_000 {
+                LAST_SWEEP_MS.store(now, Ordering::Relaxed);
+                self.mutate_with_update_context(|context| {
+                    context.library.expire_idle_meshes(now, 20_000);
+                });
+            }
+        }
+
         self.frame_accumulator += dt;
         let frame_duration = self.frame_duration();
 
