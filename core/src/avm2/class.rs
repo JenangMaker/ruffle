@@ -1005,6 +1005,10 @@ impl<'gc> Class<'gc> {
         *self.0.vtable.get().expect("VTable not yet initialized!")
     }
 
+    pub fn vtable_if_ready(self) -> Option<VTable<'gc>> {
+        self.0.vtable.get().copied()
+    }
+
     pub fn dollar_removed_name(self, mc: &Mutation<'gc>) -> QName<'gc> {
         let name = self.name();
 

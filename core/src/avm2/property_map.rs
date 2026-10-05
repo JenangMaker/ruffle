@@ -26,7 +26,7 @@ use std::collections::HashMap;
 #[derive(Clone, Debug, Collect)]
 #[collect(no_drop)]
 pub struct PropertyMap<'gc, V>(
-    HashMap<AvmString<'gc>, SmallVec<[(Namespace<'gc>, V); 2]>, FnvBuildHasher>,
+    HashMap<AvmString<'gc>, SmallVec<[(Namespace<'gc>, V); 1]>, FnvBuildHasher>,
 );
 
 impl<V> Default for PropertyMap<'_, V> {
