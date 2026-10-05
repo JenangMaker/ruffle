@@ -85,6 +85,7 @@ impl<'gc> Graphic<'gc> {
             source,
             movie,
             scaled_handle: RefCell::new(TessellationCache::new()),
+            last_drawn_ms: Default::default(),
         };
 
         Graphic(Gc::new(
@@ -110,6 +111,7 @@ impl<'gc> Graphic<'gc> {
             source: None,
             movie: context.root_swf.clone(),
             scaled_handle: RefCell::new(TessellationCache::new()),
+            last_drawn_ms: Default::default(),
         };
 
         Graphic(Gc::new(
@@ -140,6 +142,17 @@ impl<'gc> Graphic<'gc> {
         unlock!(Gc::write(mc, self.0), GraphicData, shared).set(shared);
     }
 
+    /// Drops this shape's tessellations if none was drawn in the last
+    /// `idle_ms` (they are made again on the next draw); returns whether any
+    /// were dropped. A shape drawn once, as AQW's avatar snapshots
+    /// (BitmapData.draw) are, otherwise keeps its meshes and their GPU
+    /// buffers for as long as its movie's library lives.
+    pub fn expire_meshes(self, now_ms: u64, idle_ms: u64) -> bool {
+        let shared = self.0.shared.get();
+        now_ms.saturating_sub(shared.last_drawn_ms.get()) >= idle_ms
+            && shared.scaled_handle.borrow_mut().clear()
+    }
+
     /// Returns the best shape handle for the current scale, retessellating if necessary
     /// (`None` if the movie's library is gone).
     fn get_or_retessellate_handle(
@@ -151,6 +164,7 @@ impl<'gc> Graphic<'gc> {
         // cached tessellation from another instance at a similar scale.
         let shared = self.0.shared.get();
 
+        shared.last_drawn_ms.set(mesh_clock_ms());
         {
             let mut cache = shared.scaled_handle.borrow_mut();
             if let Some(handle) = cache.find_near_and_touch(current_scale) {
@@ -361,6 +375,15 @@ struct GraphicShared {
     movie: Arc<SwfMovie>,
     #[collect(require_static)]
     scaled_handle: RefCell<TessellationCache>,
+    /// When a tessellation was last drawn (`mesh_clock_ms`), for
+    /// `expire_meshes`.
+    last_drawn_ms: std::cell::Cell<u64>,
+}
+
+/// Milliseconds since the first call, for when meshes were last drawn.
+pub(crate) fn mesh_clock_ms() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
 }
 
 impl GraphicShared {

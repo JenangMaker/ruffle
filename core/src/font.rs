@@ -356,6 +356,7 @@ impl<'gc> Font<'gc> {
     ) -> Font<'gc> {
         let mut code_point_to_glyph = fnv::FnvHashMap::default();
 
+        let _ = renderer;
         let descriptor = FontDescriptor::from_swf_tag(&tag, encoding);
         let (ascent, descent, leading) = if let Some(layout) = &tag.layout {
             (layout.ascent as i32, layout.descent as i32, layout.leading)
@@ -374,14 +375,12 @@ impl<'gc> Font<'gc> {
                 let character = char::from_u32(code as u32).unwrap_or(char::REPLACEMENT_CHARACTER);
                 code_point_to_glyph.insert(code, index);
 
-                let glyph = Glyph::from_swf(character, swf_glyph);
-
-                // Eager-load ASCII characters.
-                if code < 128 {
-                    glyph.glyph_render_data(renderer);
-                }
-
-                glyph
+                // A glyph's shape is registered with the renderer the first
+                // time it is drawn (`glyph_render_data`). Doing it here for
+                // every ASCII glyph cost each embedded font its whole alphabet
+                // of meshes up front, drawn or not: in AQW, every copy of a
+                // loaded UI file, about 87 MB after 16 map changes.
+                Glyph::from_swf(character, swf_glyph)
             })
             .collect();
 

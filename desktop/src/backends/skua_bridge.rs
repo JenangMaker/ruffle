@@ -762,3 +762,79 @@ fn from_json(value: &Json) -> ExternalValue {
         ),
     }
 }
+
+/// SKUA_MEMORY_STATS=1: once a minute, a line on what the player holds, for
+/// hunting what grows over a session (map changes, other players' gear):
+/// resident memory, live GC objects, the loaded SWFs still alive (count,
+/// bytes, the kinds with the most copies), orphaned clips, and what kept the
+/// libraries of loaded movies alive at the last collection.
+pub fn memory_stats_due() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    if !*ON.get_or_init(|| std::env::var_os("SKUA_MEMORY_STATS").is_some_and(|v| v != "0")) {
+        return false;
+    }
+    let Ok(mut last) = LAST.lock() else { return false };
+    match *last {
+        Some(t) if t.elapsed() < Duration::from_secs(60) => false,
+        _ => {
+            *last = Some(Instant::now());
+            true
+        }
+    }
+}
+
+pub fn log_memory_stats(stats_json: &str) {
+    let rss_mb = std::fs::read_to_string("/proc/self/statm")
+        .ok()
+        .and_then(|s| s.split_whitespace().nth(1).and_then(|p| p.parse::<u64>().ok()))
+        .map(|pages| pages * 4096 / (1024 * 1024))
+        .unwrap_or(0);
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(stats_json) else {
+        return;
+    };
+    let movies = v["movies"].as_array().cloned().unwrap_or_default();
+    let count: u64 = movies.iter().filter_map(|m| m["count"].as_u64()).sum();
+    let bytes: u64 = movies.iter().filter_map(|m| m["bytes"].as_u64()).sum();
+    // The kinds of asset with the most live copies: the folder part of the
+    // URL ("maps", "items/swords", ...) groups a kind.
+    let mut kinds: std::collections::BTreeMap<String, (u64, u64)> = Default::default();
+    for m in &movies {
+        let url = m["url"].as_str().unwrap_or("");
+        let path = url.split("/gamefiles/").nth(1).unwrap_or(url);
+        let kind = path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("(top)").to_string();
+        let e = kinds.entry(kind).or_default();
+        e.0 += m["count"].as_u64().unwrap_or(0);
+        e.1 += m["bytes"].as_u64().unwrap_or(0);
+    }
+    let mut kinds: Vec<_> = kinds.into_iter().collect();
+    kinds.sort_by(|a, b| b.1.0.cmp(&a.1.0));
+    let top = kinds
+        .iter()
+        .take(6)
+        .map(|(k, (c, b))| format!("{k} {c} ({:.1} MB)", *b as f64 / 1048576.0))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let lib = &v["lastGcLibraries"];
+    let kept = lib["kept"]
+        .as_object()
+        .map(|o| {
+            o.iter()
+                .map(|(reason, k)| format!("{reason} {}", k["count"]))
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+    tracing::warn!(
+        "skua bridge: memory: rss {} MB, {} GC objects, {} orphans; {} SWFs alive ({:.1} MB): {}; last GC libraries: {} collectable, {} dropped, kept by {}",
+        rss_mb,
+        v["gcObjects"],
+        v["orphans"],
+        count,
+        bytes as f64 / 1048576.0,
+        top,
+        lib["collectable"],
+        lib["dropped"],
+        if kept.is_empty() { "-".to_string() } else { kept },
+    );
+}
