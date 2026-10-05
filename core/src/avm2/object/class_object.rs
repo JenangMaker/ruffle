@@ -212,11 +212,12 @@ impl<'gc> ClassObject<'gc> {
         let mc = activation.gc();
         let class = self.inner_class_definition();
 
-        let vtable = VTable::new_with_interface_properties(
+        let vtable = VTable::new_sharing_traits(
             class,
             self.superclass_object(),
             Some(self.instance_scope()),
             self.superclass_object().map(|cls| cls.instance_vtable()),
+            class.vtable_if_ready(),
             activation.context,
         );
         // If the vtable weren't valid, creation of the `Class` would have

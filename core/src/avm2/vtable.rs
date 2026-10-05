@@ -29,6 +29,12 @@ struct VTableData<'gc> {
 
     resolved_traits: PropertyMap<'gc, Property>,
 
+    /// A vtable whose `resolved_traits` are this one's, used in place of
+    /// `resolved_traits` (then empty): a class object's instance vtable and its
+    /// class definition's come out the same, and AQW has thousands of classes,
+    /// each carrying a full copy of its superclasses' traits.
+    traits_from: Option<VTable<'gc>>,
+
     /// Use hashmaps for the metadata tables because metadata will rarely be present on traits
     slot_metadata_table: HashMap<usize, Box<[Metadata<'gc>]>>,
 
@@ -112,8 +118,42 @@ impl<'gc> VTable<'gc> {
         Ok(VTable(Gc::new(context.gc(), this)))
     }
 
+    /// `new_with_interface_properties` for a class object's instance vtable. Its
+    /// traits are built from the same class and the same superclass chain as
+    /// the class definition's vtable (`class_vtable`), so when they come out
+    /// equal (checked, entry by entry) that vtable's are used instead of a copy.
+    pub fn new_sharing_traits(
+        defining_class_def: Class<'gc>,
+        super_class_obj: Option<ClassObject<'gc>>,
+        scope: Option<ScopeChain<'gc>>,
+        superclass_vtable: Option<Self>,
+        class_vtable: Option<Self>,
+        context: &UpdateContext<'gc>,
+    ) -> Result<Self, VTableInitError> {
+        let mut this = Self::init_vtable(
+            defining_class_def,
+            super_class_obj,
+            scope,
+            superclass_vtable,
+        )?;
+        Self::copy_interface_properties(&mut this, defining_class_def, context);
+
+        if let Some(class_vtable) = class_vtable
+            && same_traits(&this.resolved_traits, class_vtable.resolved_traits())
+        {
+            this.resolved_traits = PropertyMap::new();
+            this.traits_from = Some(class_vtable);
+        }
+
+        Ok(VTable(Gc::new(context.gc(), this)))
+    }
+
     pub fn resolved_traits(self) -> &'gc PropertyMap<'gc, Property> {
-        &Gc::as_ref(self.0).resolved_traits
+        let data = Gc::as_ref(self.0);
+        match data.traits_from {
+            Some(source) => source.resolved_traits(),
+            None => &data.resolved_traits,
+        }
     }
 
     pub fn get_metadata_for_slot(self, slot_id: usize) -> Option<&'gc [Metadata<'gc>]> {
@@ -528,6 +568,7 @@ impl<'gc> VTable<'gc> {
             resolved_traits,
             slot_metadata_table,
             disp_metadata_table,
+            traits_from: None,
             slot_table: slot_table.into_boxed_slice(),
             method_table: method_table.into_boxed_slice(),
         })
@@ -625,4 +666,28 @@ fn trait_to_default_value<'gc>(trait_data: &Trait<'gc>) -> Value<'gc> {
         TraitKind::Class { .. } => Value::Null,
         _ => unreachable!(),
     }
+}
+
+/// Whether two trait maps hold the same names, namespaces and properties.
+fn same_traits<'gc>(a: &PropertyMap<'gc, Property>, b: &PropertyMap<'gc, Property>) -> bool {
+    let mut count = 0;
+    for (name, ns, prop) in a.iter() {
+        count += 1;
+        let Some(other) = b.get(QName::new(ns, name)) else {
+            return false;
+        };
+        let same = match (prop, other) {
+            (Property::Virtual { get: g1, set: s1 }, Property::Virtual { get: g2, set: s2 }) => {
+                g1 == g2 && s1 == s2
+            }
+            (Property::Method { disp_id: a }, Property::Method { disp_id: b }) => a == b,
+            (Property::Slot { slot_id: a }, Property::Slot { slot_id: b }) => a == b,
+            (Property::ConstSlot { slot_id: a }, Property::ConstSlot { slot_id: b }) => a == b,
+            _ => false,
+        };
+        if !same {
+            return false;
+        }
+    }
+    count == b.iter().count()
 }
