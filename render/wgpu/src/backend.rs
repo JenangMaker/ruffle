@@ -392,6 +392,17 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
         &self.descriptors.device
     }
 
+    /// VibeSkua: the offscreen pool is only emptied at the end of a frame, and
+    /// a hidden or headless tab draws no frames while the game still draws into
+    /// BitmapData all the time: each draw of a new size (with filters on, their
+    /// intermediate textures too) added textures that were kept until the tab
+    /// drew again, 1.7 GB per AQW tab. Empty it whenever that work is flushed.
+    fn trim_offscreen_pool(&mut self) {
+        if self.active_frame.draws_since_flush == 0 {
+            self.offscreen_texture_pool = TexturePool::new();
+        }
+    }
+
     pub fn make_queue_sync_handle(
         &self,
         target: TextureTarget,
@@ -837,6 +848,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         );
 
         self.active_frame.maybe_flush(&self.descriptors);
+        self.trim_offscreen_pool();
         Some(self.make_queue_sync_handle(target, None, handle, bounds))
     }
 
@@ -950,6 +962,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         );
 
         self.active_frame.maybe_flush(&self.descriptors);
+        self.trim_offscreen_pool();
         Some(self.make_queue_sync_handle(target, None, destination, copy_area))
     }
 
