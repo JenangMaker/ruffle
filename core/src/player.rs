@@ -309,6 +309,11 @@ enum RunState {
     Stepping,
 }
 
+/// How many full collections (System.gc()) have run, in every player of this
+/// process: a desktop embedder can return the freed memory to the system
+/// after one (malloc_trim).
+pub static FULL_COLLECTIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 pub struct Player {
     /// The version of the player we're emulating.
     ///
@@ -2470,6 +2475,7 @@ impl Player {
             // things before they became garbage), then run a whole fresh one.
             Self::finish_gc_cycle(arena);
             Self::finish_gc_cycle(arena);
+            FULL_COLLECTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return;
         }
 

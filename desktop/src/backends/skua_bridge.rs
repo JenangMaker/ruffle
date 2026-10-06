@@ -784,12 +784,62 @@ pub fn memory_stats_due() -> bool {
     }
 }
 
-pub fn log_memory_stats(stats_json: &str) {
-    let rss_mb = std::fs::read_to_string("/proc/self/statm")
+/// This process's resident memory in MB (0 if /proc can't say).
+fn rss_mb() -> u64 {
+    std::fs::read_to_string("/proc/self/statm")
         .ok()
         .and_then(|s| s.split_whitespace().nth(1).and_then(|p| p.parse::<u64>().ok()))
         .map(|pages| pages * 4096 / (1024 * 1024))
-        .unwrap_or(0);
+        .unwrap_or(0)
+}
+
+/// After a full collection (System.gc(), which AQW calls after every map
+/// change), hands the freed memory back to the system: glibc keeps freed
+/// pages in its heaps, so a player's RSS stayed near its peak. With
+/// SKUA_MEMORY_STATS on, logs what it gave back. RUFFLE_MALLOC_TRIM=0 turns
+/// it off.
+pub fn trim_after_full_gc() {
+    #[cfg(target_env = "gnu")]
+    {
+        static SEEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        static ON: OnceLock<bool> = OnceLock::new();
+        let n = ruffle_core::FULL_COLLECTIONS.load(Ordering::Relaxed);
+        if SEEN.swap(n, Ordering::Relaxed) == n
+            || !*ON.get_or_init(|| std::env::var("RUFFLE_MALLOC_TRIM").map_or(true, |v| v.trim() != "0"))
+        {
+            return;
+        }
+        // On its own thread: trimming a big heap took 0.4 s in a test, and
+        // the game thread only waits for glibc's locks meanwhile. One at a time.
+        static TRIMMING: AtomicBool = AtomicBool::new(false);
+        if TRIMMING.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let spawned = std::thread::Builder::new().name("malloc-trim".into()).spawn(|| {
+            let before = rss_mb();
+            let started = Instant::now();
+            // SAFETY: malloc_trim only releases free memory; it takes glibc's locks.
+            unsafe { libc::malloc_trim(0) };
+            if std::env::var_os("SKUA_MEMORY_STATS").is_some_and(|v| v != "0") {
+                let after = rss_mb();
+                tracing::warn!(
+                    "[memory] after System.gc: malloc_trim gave back {} MB ({} -> {} MB) in {} ms",
+                    before.saturating_sub(after),
+                    before,
+                    after,
+                    started.elapsed().as_millis()
+                );
+            }
+            TRIMMING.store(false, Ordering::Release);
+        });
+        if spawned.is_err() {
+            TRIMMING.store(false, Ordering::Release);
+        }
+    }
+}
+
+pub fn log_memory_stats(stats_json: &str) {
+    let rss_mb = rss_mb();
     let Ok(v) = serde_json::from_str::<serde_json::Value>(stats_json) else {
         return;
     };
