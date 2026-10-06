@@ -1353,6 +1353,15 @@ impl ActiveFrame {
 pub(crate) fn offscreen_effects() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        !std::env::var("RUFFLE_FILTERS").is_ok_and(|v| v.eq_ignore_ascii_case("off"))
+        // Unset: Ruffle as usual (on). Set: only on, 1 or true turns them on;
+        // any other value (a typo, an option that does not exist) is off,
+        // never the slow path by accident.
+        match std::env::var("RUFFLE_FILTERS") {
+            Err(_) => true,
+            Ok(v) => {
+                let v = v.trim();
+                v.eq_ignore_ascii_case("on") || v == "1" || v.eq_ignore_ascii_case("true")
+            }
+        }
     })
 }
