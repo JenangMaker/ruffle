@@ -126,24 +126,12 @@ impl Surface {
 
         let mut num_masks = 0;
         let mut mask_state = MaskState::NoMask;
-        let chunks = chunk_blends(
-            commands,
-            descriptors,
-            staging_belt,
-            dynamic_transforms,
-            draw_encoder,
-            meshes,
-            self.quality,
-            target.width(),
-            target.height(),
-            match nearest_layer {
-                LayerRef::Current => LayerRef::Parent(&target),
-                layer => layer,
-            },
-            texture_pool,
-        );
-
-        for chunk in chunks {
+        // VibeSkua: each chunk runs as soon as chunk_blends makes it (see
+        // WgpuCommandHandler::push_chunk).
+        let mut execute = |chunk: Chunk,
+                           staging_belt: &mut wgpu::util::StagingBelt,
+                           draw_encoder: &mut Scope<'global, wgpu::CommandEncoder>,
+                           texture_pool: &mut TexturePool| {
             match chunk {
                 Chunk::Draw {
                     chunk,
@@ -240,7 +228,7 @@ impl Surface {
                             match nearest_layer {
                                 LayerRef::None => {
                                     // An Alpha or Erase with no Layer above it should be ignored
-                                    continue;
+                                    return;
                                 }
                                 LayerRef::Current => &target,
                                 LayerRef::Parent(layer) => layer,
@@ -344,6 +332,26 @@ impl Surface {
                     render_pass.draw_indexed(0..6, 0, 0..1);
                 }
             }
+        };
+        let chunks = chunk_blends(
+            commands,
+            descriptors,
+            staging_belt,
+            dynamic_transforms,
+            draw_encoder,
+            meshes,
+            self.quality,
+            target.width(),
+            target.height(),
+            match nearest_layer {
+                LayerRef::Current => LayerRef::Parent(&target),
+                layer => layer,
+            },
+            texture_pool,
+            Some(&mut execute),
+        );
+        for chunk in chunks {
+            execute(chunk, staging_belt, draw_encoder, texture_pool);
         }
 
         // If nothing happened, ensure it's cleared so we don't operate on garbage data
