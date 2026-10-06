@@ -492,6 +492,15 @@ pub enum LayerRef<'a> {
 /// Replaces every blend with a RenderBitmap, with the subcommands rendered out to a temporary texture
 /// Every complex blend will be its own item, but every other draw will be chunked together
 #[expect(clippy::too_many_arguments)]
+/// VibeSkua: where `chunk_blends` hands each chunk as soon as it is made, with
+/// the encoder state to execute it (see `Surface::draw_commands`).
+pub type ChunkSink<'a, 'global> = &'a mut dyn FnMut(
+    Chunk,
+    &mut wgpu::util::StagingBelt,
+    &mut Scope<'global, wgpu::CommandEncoder>,
+    &mut TexturePool,
+);
+
 pub fn chunk_blends<'encoder, 'global: 'encoder>(
     commands: CommandList,
     descriptors: &'encoder Descriptors,
@@ -502,8 +511,9 @@ pub fn chunk_blends<'encoder, 'global: 'encoder>(
     quality: StageQuality,
     width: u32,
     height: u32,
-    nearest_layer: LayerRef,
+    nearest_layer: LayerRef<'encoder>,
     texture_pool: &'encoder mut TexturePool,
+    sink: Option<ChunkSink<'encoder, 'global>>,
 ) -> Vec<Chunk> {
     WgpuCommandHandler::new(
         descriptors,
@@ -516,6 +526,7 @@ pub fn chunk_blends<'encoder, 'global: 'encoder>(
         height,
         nearest_layer,
         texture_pool,
+        sink,
     )
     .chunk_blends(commands)
 }
@@ -532,6 +543,7 @@ struct WgpuCommandHandler<'encoder, 'global: 'encoder> {
     draw_encoder: &'encoder mut Scope<'global, wgpu::CommandEncoder>,
     texture_pool: &'encoder mut TexturePool,
     emulate_lines: bool,
+    sink: Option<ChunkSink<'encoder, 'global>>,
 
     result: Vec<Chunk>,
     current: Vec<DrawCommand>,
@@ -554,6 +566,7 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
         height: u32,
         nearest_layer: LayerRef<'encoder>,
         texture_pool: &'encoder mut TexturePool,
+        sink: Option<ChunkSink<'encoder, 'global>>,
     ) -> Self {
         let transforms = Self::new_transforms(descriptors, dynamic_transforms);
         let vertices = Self::new_vertices(descriptors, dynamic_transforms);
@@ -575,6 +588,7 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
             draw_encoder,
             texture_pool,
             emulate_lines,
+            sink,
 
             result: vec![],
             current: vec![],
@@ -582,6 +596,25 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
             vertices,
             needs_stencil: false,
             num_masks: 0,
+        }
+    }
+
+    /// VibeSkua: every blend group's content is drawn into its own texture
+    /// the size of the stage. Kept in a list until the whole command list was
+    /// gone through, they were all alive at once: AQW's Battleon draws ~590
+    /// Multiply, Overlay and Add groups a frame, 590 stage-sized textures
+    /// (1.3 GB at 930x610) held by the pool for good. Executed as soon as it is
+    /// made, a chunk gives its texture back for the next group to reuse; the
+    /// GPU work is in the same order on the same encoder.
+    fn push_chunk(&mut self, chunk: Chunk) {
+        match &mut self.sink {
+            Some(sink) => sink(
+                chunk,
+                self.staging_belt,
+                self.draw_encoder,
+                self.texture_pool,
+            ),
+            None => self.result.push(chunk),
         }
     }
 
@@ -621,12 +654,21 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
         );
 
         if !current.is_empty() {
-            result.push(Chunk::Draw {
+            let chunk = Chunk::Draw {
                 chunk: current,
                 needs_stencil,
                 transforms,
                 vertices,
-            });
+            };
+            match &mut self.sink {
+                Some(sink) => sink(
+                    chunk,
+                    self.staging_belt,
+                    self.draw_encoder,
+                    self.texture_pool,
+                ),
+                None => result.push(chunk),
+            }
         }
 
         result
@@ -676,7 +718,7 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
                 vertices_range.map(|v| v.start),
             ));
         } else {
-            self.result.push(Chunk::Draw {
+            let chunk = Chunk::Draw {
                 chunk: mem::take(&mut self.current),
                 needs_stencil: self.needs_stencil,
                 transforms: mem::replace(
@@ -687,7 +729,8 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
                     &mut self.vertices,
                     Self::new_vertices(self.descriptors, self.dynamic_transforms),
                 ),
-            });
+            };
+            self.push_chunk(chunk);
             let transform_range = self
                 .transforms
                 .add(&[transform])
@@ -795,7 +838,7 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
             }
             blend_type => {
                 if !self.current.is_empty() {
-                    self.result.push(Chunk::Draw {
+                    let chunk = Chunk::Draw {
                         chunk: mem::take(&mut self.current),
                         needs_stencil: self.needs_stencil,
                         transforms: mem::replace(
@@ -806,18 +849,20 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
                             &mut self.vertices,
                             Self::new_vertices(self.descriptors, self.dynamic_transforms),
                         ),
-                    });
+                    };
+                    self.push_chunk(chunk);
                 }
                 let chunk_blend_mode = match blend_type {
                     BlendType::Complex(complex) => ChunkBlendMode::Complex(complex),
                     BlendType::Shader(shader) => ChunkBlendMode::Shader(shader),
                     _ => unreachable!(),
                 };
-                self.result.push(Chunk::Blend {
+                let chunk = Chunk::Blend {
                     texture: target.take_color_texture(),
                     blend_mode: chunk_blend_mode,
                     needs_stencil: self.num_masks > 0,
-                });
+                };
+                self.push_chunk(chunk);
                 self.needs_stencil = self.num_masks > 0;
             }
         }
