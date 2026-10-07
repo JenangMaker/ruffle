@@ -793,37 +793,59 @@ fn rss_mb() -> u64 {
         .unwrap_or(0)
 }
 
-/// After a full collection (System.gc(), which AQW calls after every map
-/// change), hands the freed memory back to the system: glibc keeps freed
-/// pages in its heaps, so a player's RSS stayed near its peak. With
-/// SKUA_MEMORY_STATS on, logs what it gave back. RUFFLE_MALLOC_TRIM=0 turns
-/// it off.
+/// Hands memory the allocator holds but nothing uses back to the system:
+/// glibc keeps freed pages in its heaps, so a player's RSS stayed near its
+/// peak. After a full collection (System.gc(), which AQW calls after every map
+/// change), and, for scripts that stay in one map, once its RSS has grown
+/// 150 MB since the last trim (checked once a minute). With SKUA_MEMORY_STATS
+/// on, logs what it gave back. RUFFLE_MALLOC_TRIM=0 turns it off.
 pub fn trim_after_full_gc() {
     #[cfg(target_env = "gnu")]
     {
         static SEEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         static ON: OnceLock<bool> = OnceLock::new();
-        let n = ruffle_core::FULL_COLLECTIONS.load(Ordering::Relaxed);
-        if SEEN.swap(n, Ordering::Relaxed) == n
-            || !*ON.get_or_init(|| std::env::var("RUFFLE_MALLOC_TRIM").map_or(true, |v| v.trim() != "0"))
-        {
+        static LAST_CHECK: Mutex<Option<Instant>> = Mutex::new(None);
+        // RSS after the last trim (0: none yet).
+        static BASE_MB: AtomicU64 = AtomicU64::new(0);
+        if !*ON.get_or_init(|| std::env::var("RUFFLE_MALLOC_TRIM").map_or(true, |v| v.trim() != "0")) {
             return;
         }
+        let n = ruffle_core::FULL_COLLECTIONS.load(Ordering::Relaxed);
+        let reason = if SEEN.swap(n, Ordering::Relaxed) != n {
+            "after System.gc"
+        } else {
+            let Ok(mut last) = LAST_CHECK.lock() else { return };
+            if last.is_some_and(|t| t.elapsed() < Duration::from_secs(60)) {
+                return;
+            }
+            *last = Some(Instant::now());
+            let base = BASE_MB.load(Ordering::Relaxed);
+            if base == 0 {
+                BASE_MB.store(rss_mb(), Ordering::Relaxed);
+                return;
+            }
+            if rss_mb() < base + 150 {
+                return;
+            }
+            "grew 150 MB"
+        };
         // On its own thread: trimming a big heap took 0.4 s in a test, and
         // the game thread only waits for glibc's locks meanwhile. One at a time.
         static TRIMMING: AtomicBool = AtomicBool::new(false);
         if TRIMMING.swap(true, Ordering::AcqRel) {
             return;
         }
-        let spawned = std::thread::Builder::new().name("malloc-trim".into()).spawn(|| {
+        let spawned = std::thread::Builder::new().name("malloc-trim".into()).spawn(move || {
             let before = rss_mb();
             let started = Instant::now();
             // SAFETY: malloc_trim only releases free memory; it takes glibc's locks.
             unsafe { libc::malloc_trim(0) };
+            let after = rss_mb();
+            BASE_MB.store(after, Ordering::Relaxed);
             if std::env::var_os("SKUA_MEMORY_STATS").is_some_and(|v| v != "0") {
-                let after = rss_mb();
                 tracing::warn!(
-                    "[memory] after System.gc: malloc_trim gave back {} MB ({} -> {} MB) in {} ms",
+                    "[memory] {}: malloc_trim gave back {} MB ({} -> {} MB) in {} ms",
+                    reason,
                     before.saturating_sub(after),
                     before,
                     after,
@@ -836,6 +858,41 @@ pub fn trim_after_full_gc() {
             TRIMMING.store(false, Ordering::Release);
         }
     }
+}
+
+/// Where the resident memory is: anonymous (heap) vs file and shared mappings
+/// (the GPU driver's buffers are shared), and of glibc's heap how much is in
+/// use vs freed but kept by the allocator (what malloc_trim can give back).
+fn rss_split() -> String {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let field = |name: &str| {
+        status
+            .lines()
+            .find(|l| l.starts_with(name))
+            .and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok())
+            .map_or(0, |kb| kb / 1024)
+    };
+    let mut out = format!(
+        "anon {} MB, file {} MB, shmem {} MB",
+        field("RssAnon:"),
+        field("RssFile:"),
+        field("RssShmem:")
+    );
+    #[cfg(target_env = "gnu")]
+    {
+        // mallinfo, not mallinfo2 (glibc 2.33+): int fields, fine below 2 GB.
+        #[allow(deprecated)]
+        // SAFETY: mallinfo only reads glibc's allocator statistics.
+        let m = unsafe { libc::mallinfo() };
+        let mb = |b: libc::c_int| (b as u32 as u64) / 1048576;
+        out.push_str(&format!(
+            "; malloc: in use {} MB, free kept {} MB, mmapped {} MB",
+            mb(m.uordblks),
+            mb(m.fordblks),
+            mb(m.hblkhd)
+        ));
+    }
+    out
 }
 
 pub fn log_memory_stats(stats_json: &str) {
@@ -876,8 +933,9 @@ pub fn log_memory_stats(stats_json: &str) {
         })
         .unwrap_or_default();
     tracing::warn!(
-        "skua bridge: memory: rss {} MB, {} GC objects, {} orphans; {} SWFs alive ({:.1} MB): {}; last GC libraries: {} collectable, {} dropped, kept by {}",
+        "skua bridge: memory: rss {} MB ({}), {} GC objects, {} orphans; {} SWFs alive ({:.1} MB): {}; last GC libraries: {} collectable, {} dropped, kept by {}",
         rss_mb,
+        rss_split(),
         v["gcObjects"],
         v["orphans"],
         count,
