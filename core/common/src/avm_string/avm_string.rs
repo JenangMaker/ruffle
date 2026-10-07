@@ -7,6 +7,33 @@ use ruffle_wstr::{Pattern, WStr, WString, wstr_impl_traits};
 use std::borrow::Cow;
 use std::ops::Deref;
 
+/// Strings of at least this many bytes count toward the collector's pacing.
+const DEBT_MIN_BYTES: usize = 1024;
+/// Bytes of string buffer counted as one more allocated object.
+const DEBT_BYTES_PER_GC: f64 = 256.0;
+
+/// RUFFLE_STRING_GC_DEBT=0 turns the accounting below off.
+fn debt_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RUFFLE_STRING_GC_DEBT").map_or(true, |v| v.trim() != "0"))
+}
+
+/// Allocates an owned string, telling the collector about a big buffer.
+/// gc-arena paces collection by the number of objects allocated, and a
+/// string's buffer lives outside the GC heap: a 300 KB string counted as much
+/// as a 16-byte one. AQW under Skua builds big JSON strings many times a
+/// second (each reply to a game read), and between collections hundreds of
+/// MB of them piled up. Counting each big buffer as extra allocations makes
+/// the collector keep pace with the bytes, not just the object count.
+fn alloc<'gc>(mc: &Mutation<'gc>, repr: AvmStringRepr<'gc>) -> Gc<'gc, AvmStringRepr<'gc>> {
+    let s = repr.as_wstr();
+    let bytes = s.len() << usize::from(s.is_wide());
+    if bytes >= DEBT_MIN_BYTES && debt_on() {
+        mc.metrics().adjust_debt(bytes as f64 / DEBT_BYTES_PER_GC);
+    }
+    Gc::new(mc, repr)
+}
+
 #[derive(Clone, Copy, Collect)]
 #[collect(no_drop)]
 pub struct AvmString<'gc>(Gc<'gc, AvmStringRepr<'gc>>);
@@ -16,7 +43,7 @@ impl<'gc> AvmString<'gc> {
     pub(super) fn to_fully_owned(self, mc: &Mutation<'gc>) -> Gc<'gc, AvmStringRepr<'gc>> {
         if self.0.is_dependent() {
             let repr = AvmStringRepr::from_raw(WString::from(self.as_wstr()), false);
-            Gc::new(mc, repr)
+            alloc(mc, repr)
         } else {
             self.0
         }
@@ -33,7 +60,7 @@ impl<'gc> AvmString<'gc> {
             Cow::Borrowed(utf8) => WString::from_utf8(utf8),
         };
         let repr = AvmStringRepr::from_raw(buf, false);
-        Self(Gc::new(gc_context, repr))
+        Self(alloc(gc_context, repr))
     }
 
     pub fn new_utf8_bytes(gc_context: &Mutation<'gc>, bytes: &[u8]) -> Self {
@@ -43,7 +70,7 @@ impl<'gc> AvmString<'gc> {
 
     pub fn new<S: Into<WString>>(gc_context: &Mutation<'gc>, string: S) -> Self {
         let repr = AvmStringRepr::from_raw(string.into(), false);
-        Self(Gc::new(gc_context, repr))
+        Self(alloc(gc_context, repr))
     }
 
     pub fn substring(mc: &Mutation<'gc>, string: AvmString<'gc>, start: usize, end: usize) -> Self {
