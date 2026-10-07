@@ -682,7 +682,47 @@ pub fn handle_call(player: &mut Player, text: &str) {
         Ok(value) => json!({ "id": id as i64, "ok": true, "value": value }),
         Err(error) => json!({ "id": id as i64, "ok": false, "error": error }),
     };
-    send_to_skua(reply.to_string());
+    let text = reply.to_string();
+    note_reply(name, message.get("args").and_then(|a| a.get(0)).and_then(Json::as_str), text.len());
+    send_to_skua(text);
+}
+
+/// With SKUA_MEMORY_STATS on: calls and reply bytes per function (and first
+/// argument, the object path of getGameObject), for the memory line. A reply
+/// is a string the game built and dropped.
+static REPLIES: Mutex<Option<std::collections::HashMap<String, (u64, u64)>>> = Mutex::new(None);
+
+fn note_reply(name: &str, first: Option<&str>, bytes: usize) {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("SKUA_MEMORY_STATS").is_some_and(|v| v != "0")) {
+        return;
+    }
+    let key = match first {
+        Some(arg) if arg.len() <= 60 => format!("{name}({arg})"),
+        _ => name.to_string(),
+    };
+    if let Ok(mut map) = REPLIES.lock() {
+        let entry = map.get_or_insert_with(Default::default).entry(key).or_default();
+        entry.0 += 1;
+        entry.1 += bytes as u64;
+    }
+}
+
+/// The last minute's replies: total, then the five largest by bytes.
+fn take_replies() -> String {
+    let Some(map) = REPLIES.lock().ok().and_then(|mut m| m.take()) else {
+        return "-".into();
+    };
+    let calls: u64 = map.values().map(|v| v.0).sum();
+    let bytes: u64 = map.values().map(|v| v.1).sum();
+    let mut top: Vec<_> = map.into_iter().collect();
+    top.sort_by(|a, b| b.1.1.cmp(&a.1.1));
+    let top: Vec<String> = top
+        .iter()
+        .take(5)
+        .map(|(k, (n, b))| format!("{k} {n}x {:.1} MB", *b as f64 / 1048576.0))
+        .collect();
+    format!("{calls} calls, {:.1} MB: {}", bytes as f64 / 1048576.0, top.join(", "))
 }
 
 /// The page's own functions (window.vibeskua in the browser build):
@@ -945,4 +985,6 @@ pub fn log_memory_stats(stats_json: &str) {
         lib["dropped"],
         if kept.is_empty() { "-".to_string() } else { kept },
     );
+    // Its own line: the container log cuts long lines.
+    tracing::warn!("skua bridge: replies to Skua in the last minute: {}", take_replies());
 }
