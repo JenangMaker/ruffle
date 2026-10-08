@@ -31,6 +31,34 @@ pub mod skua_stats {
     pub static INNER_GOTO_US: AtomicU64 = AtomicU64::new(0);
     /// Entries on the orphan list at the last inner goto.
     pub static ORPHANS: AtomicU64 = AtomicU64::new(0);
+    /// Frames run, and microseconds in them (`Player::run_frame`).
+    pub static FRAMES: AtomicU64 = AtomicU64::new(0);
+    pub static FRAME_US: AtomicU64 = AtomicU64::new(0);
+    /// Microseconds per AVM2 frame phase: enter, construct, frame scripts, exit.
+    pub static PHASE_US: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+    /// Microseconds in timers and in socket data (the game's packets).
+    pub static TIMERS_US: AtomicU64 = AtomicU64::new(0);
+    pub static SOCKETS_US: AtomicU64 = AtomicU64::new(0);
+    /// Objects listening for each broadcast event, at its last broadcast:
+    /// enterFrame, exitFrame, frameConstructed.
+    pub static LISTENERS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+    /// Microseconds since the first call (0 in the web build).
+    pub fn clock_us() -> u64 {
+        #[cfg(not(target_family = "wasm"))]
+        {
+            static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            START.get_or_init(std::time::Instant::now).elapsed().as_micros() as u64
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            0
+        }
+    }
+
+    pub fn add_since(stat: &AtomicU64, since: u64) {
+        stat.fetch_add(clock_us().saturating_sub(since), std::sync::atomic::Ordering::Relaxed);
+    }
 
     /// RUFFLE_INPUT_DEBUG=1: log, as `[ruffle-input]`, the window's input
     /// events and each change of the focused object (typing that misbehaves
@@ -133,28 +161,36 @@ pub fn run_all_phases_avm2(context: &mut UpdateContext<'_>) {
         return;
     }
 
+    let t = skua_stats::clock_us();
     *context.frame_phase = FramePhase::Enter;
     OrphanManager::each_orphan_obj(context, |orphan, context| {
         orphan.enter_frame(context);
     });
     stage.enter_frame(context);
+    skua_stats::add_since(&skua_stats::PHASE_US[0], t);
 
+    let t = skua_stats::clock_us();
     *context.frame_phase = FramePhase::Construct;
     OrphanManager::each_orphan_obj(context, |orphan, context| {
         orphan.construct_frame(context);
     });
     stage.construct_frame(context);
     broadcast_frame_constructed(context);
+    skua_stats::add_since(&skua_stats::PHASE_US[1], t);
 
+    let t = skua_stats::clock_us();
     *context.frame_phase = FramePhase::FrameScripts;
     OrphanManager::each_orphan_obj(context, |orphan, context| {
         orphan.run_frame_scripts(context);
     });
     stage.run_frame_scripts(context);
     run_frame_script_cleanup(context);
+    skua_stats::add_since(&skua_stats::PHASE_US[2], t);
 
+    let t = skua_stats::clock_us();
     *context.frame_phase = FramePhase::Exit;
     broadcast_frame_exited(context);
+    skua_stats::add_since(&skua_stats::PHASE_US[3], t);
 
     // The correct time to run context3DCreated events seems to be here
     stage.check_requested_context3ds(context);

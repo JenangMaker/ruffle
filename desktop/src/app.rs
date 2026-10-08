@@ -430,7 +430,9 @@ impl MainWindow {
             if dt.as_millis() > 0.0 && due {
                 self.time = new_time;
                 self.next_frame_time = self.player.get().map(|mut player| {
+                    let tick_started = Instant::now();
                     player.tick(dt);
+                    crate::backends::skua_bridge::note_time("tick", tick_started.elapsed());
                     crate::backends::skua_bridge::trim_after_full_gc();
                     if crate::backends::skua_bridge::memory_stats_due() {
                         crate::backends::skua_bridge::log_memory_stats(&player.debug_stats());
