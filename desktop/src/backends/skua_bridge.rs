@@ -258,6 +258,7 @@ fn thread_cpu_summary(span: Duration) -> String {
 /// While a tab draws, logs a summary every minute: frames per second, the
 /// average and worst frame time, and where the time went.
 pub fn rendered(cost: Duration) {
+    note_time("draw", cost);
     RENDER_COST_US.store(cost.as_micros() as u64, Ordering::Relaxed);
     if let Ok(mut guard) = DRAW_STATS.lock() {
         let stats = guard.get_or_insert_with(DrawStats::new);
@@ -683,8 +684,109 @@ pub fn handle_call(player: &mut Player, text: &str) {
         Err(error) => json!({ "id": id as i64, "ok": false, "error": error }),
     };
     let text = reply.to_string();
-    note_reply(name, message.get("args").and_then(|a| a.get(0)).and_then(Json::as_str), text.len());
+    let key = reply_key(name, message.get("args").and_then(|a| a.get(0)).and_then(Json::as_str));
+    note_reply(&key, text.len());
+    note_time(&key, started.elapsed());
     send_to_skua(text);
+}
+
+fn reply_key(name: &str, first: Option<&str>) -> String {
+    match first {
+        Some(arg) if arg.len() <= 60 => format!("{name}({arg})"),
+        _ => name.to_string(),
+    }
+}
+
+/// With SKUA_MEMORY_STATS on: where the game thread's time goes, per minute:
+/// each Skua call (by function and first argument), the game's own ticks
+/// ("tick") and drawing ("draw").
+static TIMES: Mutex<Option<std::collections::HashMap<String, (u64, Duration)>>> = Mutex::new(None);
+
+pub fn note_time(key: &str, took: Duration) {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("SKUA_MEMORY_STATS").is_some_and(|v| v != "0")) {
+        return;
+    }
+    if let Ok(mut map) = TIMES.lock() {
+        let entry = map.get_or_insert_with(Default::default).entry(key.to_string()).or_default();
+        entry.0 += 1;
+        entry.1 += took;
+    }
+}
+
+/// This process's CPU time (all threads), from /proc/self/stat.
+fn process_cpu() -> Duration {
+    let ticks = std::fs::read_to_string("/proc/self/stat")
+        .ok()
+        .and_then(|s| {
+            let rest = s.rsplit_once(')')?.1.split_whitespace().collect::<Vec<_>>();
+            Some(rest.get(11)?.parse::<u64>().ok()? + rest.get(12)?.parse::<u64>().ok()?)
+        })
+        .unwrap_or(0);
+    Duration::from_millis(ticks * 10)
+}
+
+/// The game's frames over the last minute: how many, ms per second in them by
+/// phase, in goto passes, timers and socket data, and the listener counts.
+fn frame_breakdown() -> String {
+    use ruffle_core::skua_stats as st;
+    use std::sync::atomic::Ordering::Relaxed;
+    static LAST: Mutex<Option<[u64; 11]>> = Mutex::new(None);
+    let now = [
+        st::FRAMES.load(Relaxed),
+        st::FRAME_US.load(Relaxed),
+        st::PHASE_US[0].load(Relaxed),
+        st::PHASE_US[1].load(Relaxed),
+        st::PHASE_US[2].load(Relaxed),
+        st::PHASE_US[3].load(Relaxed),
+        st::INNER_GOTOS.load(Relaxed),
+        st::INNER_GOTO_US.load(Relaxed),
+        st::NOOP_GOTOS.load(Relaxed),
+        st::TIMERS_US.load(Relaxed),
+        st::SOCKETS_US.load(Relaxed),
+    ];
+    let was = LAST.lock().ok().and_then(|mut l| l.replace(now)).unwrap_or([0; 11]);
+    let d: Vec<u64> = now.iter().zip(was.iter()).map(|(a, b)| a.saturating_sub(*b)).collect();
+    let ms = |us: u64| us as f64 / 1000.0 / 60.0;
+    format!(
+        "frames {} ({:.0} ms/s: enter {:.0}, construct {:.0}, scripts {:.0}, exit {:.0}), goto passes {} ({:.0} ms/s, {} no-op), timers {:.0} ms/s, sockets {:.0} ms/s, orphans {}, listeners enterFrame {} exitFrame {} frameConstructed {}",
+        d[0], ms(d[1]), ms(d[2]), ms(d[3]), ms(d[4]), ms(d[5]), d[6], ms(d[7]), d[8], ms(d[9]), ms(d[10]),
+        st::ORPHANS.load(Relaxed),
+        st::LISTENERS[0].load(Relaxed), st::LISTENERS[1].load(Relaxed), st::LISTENERS[2].load(Relaxed),
+    )
+}
+
+/// The last minute: process CPU, then the game thread's busy time by kind,
+/// calls by total time.
+fn take_times() -> String {
+    static LAST: Mutex<Option<(Instant, Duration)>> = Mutex::new(None);
+    let now = (Instant::now(), process_cpu());
+    let cpu = match LAST.lock().ok().and_then(|mut l| l.replace(now)) {
+        Some((at, was)) => format!("{:.0}%", (now.1.saturating_sub(was)).as_secs_f64() * 100.0 / at.elapsed().as_secs_f64().max(1.0)),
+        None => "?".into(),
+    };
+    let Some(map) = TIMES.lock().ok().and_then(|mut m| m.take()) else {
+        return format!("process cpu {cpu}");
+    };
+    let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+    let total = |pred: &dyn Fn(&str) -> bool| map.iter().filter(|(k, _)| pred(k)).map(|(_, v)| ms(v.1)).sum::<f64>();
+    let ticks = total(&|k| k == "tick");
+    let draw = total(&|k| k == "draw");
+    let calls = total(&|k| k != "tick" && k != "draw");
+    let ncalls: u64 = map.iter().filter(|(k, _)| *k != "tick" && *k != "draw").map(|(_, v)| v.0).sum();
+    let mut top: Vec<_> = map.iter().filter(|(k, _)| *k != "tick" && *k != "draw").collect();
+    top.sort_by(|a, b| b.1.1.cmp(&a.1.1));
+    let top: Vec<String> = top.iter().take(6).map(|(k, (n, d))| format!("{k} {n}x {:.0} ms", ms(*d))).collect();
+    let frame = frame_breakdown();
+    format!(
+        "process cpu {cpu}; game thread busy {:.0} ms of each 1000: calls {:.0} ({} calls), ticks {:.0}, draw {:.0}; {frame}; top calls: {}",
+        (ticks + draw + calls) / 60.0,
+        calls / 60.0,
+        ncalls,
+        ticks / 60.0,
+        draw / 60.0,
+        top.join(", ")
+    )
 }
 
 /// With SKUA_MEMORY_STATS on: calls and reply bytes per function (and first
@@ -692,17 +794,13 @@ pub fn handle_call(player: &mut Player, text: &str) {
 /// is a string the game built and dropped.
 static REPLIES: Mutex<Option<std::collections::HashMap<String, (u64, u64)>>> = Mutex::new(None);
 
-fn note_reply(name: &str, first: Option<&str>, bytes: usize) {
+fn note_reply(key: &str, bytes: usize) {
     static ON: OnceLock<bool> = OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("SKUA_MEMORY_STATS").is_some_and(|v| v != "0")) {
         return;
     }
-    let key = match first {
-        Some(arg) if arg.len() <= 60 => format!("{name}({arg})"),
-        _ => name.to_string(),
-    };
     if let Ok(mut map) = REPLIES.lock() {
-        let entry = map.get_or_insert_with(Default::default).entry(key).or_default();
+        let entry = map.get_or_insert_with(Default::default).entry(key.to_string()).or_default();
         entry.0 += 1;
         entry.1 += bytes as u64;
     }
@@ -985,6 +1083,12 @@ pub fn log_memory_stats(stats_json: &str) {
         lib["dropped"],
         if kept.is_empty() { "-".to_string() } else { kept },
     );
+    let kinds: Vec<String> = v["displayKinds"]
+        .as_array()
+        .map(|a| a.iter().map(|k| format!("{} {}", k["kind"].as_str().unwrap_or("?"), k["count"])).collect())
+        .unwrap_or_default();
+    tracing::warn!("skua bridge: display tree {} objects: {}", v["displayObjects"], kinds.join(", "));
     // Its own line: the container log cuts long lines.
     tracing::warn!("skua bridge: replies to Skua in the last minute: {}", take_replies());
+    tracing::warn!("skua bridge: time in the last minute: {}", take_times());
 }

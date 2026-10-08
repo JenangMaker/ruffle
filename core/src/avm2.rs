@@ -500,6 +500,16 @@ impl<'gc> Avm2<'gc> {
             .entry(event_name)
             .or_default()
             .len();
+        let slot = match &*event_name.as_wstr().to_utf8_lossy() {
+            "enterFrame" => Some(0),
+            "exitFrame" => Some(1),
+            "frameConstructed" => Some(2),
+            _ => None,
+        };
+        if let Some(slot) = slot {
+            crate::frame_lifecycle::skua_stats::LISTENERS[slot]
+                .store(el_length as u64, std::sync::atomic::Ordering::Relaxed);
+        }
 
         for i in 0..el_length {
             let object = context

@@ -2070,6 +2070,13 @@ impl Player {
 
     #[instrument(level = "debug", skip_all)]
     pub fn run_frame(&mut self) {
+        let skua_started = crate::frame_lifecycle::skua_stats::clock_us();
+        self.run_frame_inner();
+        crate::frame_lifecycle::skua_stats::FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::frame_lifecycle::skua_stats::add_since(&crate::frame_lifecycle::skua_stats::FRAME_US, skua_started);
+    }
+
+    fn run_frame_inner(&mut self) {
         let frame_time = self.frame_time(750_000_000.0);
         let frame_time = Duration::from_nanos(frame_time as u64);
         let (mut execution_limit, may_execute_while_streaming) = match self.load_behavior {
@@ -2523,9 +2530,34 @@ impl Player {
                 "dropped": summary.dropped,
                 "kept": kept,
             });
+            // The display tree: how many objects, and the most common AS3
+            // classes (what piles up on the stage over a session).
+            let mut kinds: std::collections::HashMap<String, u64> = Default::default();
+            let mut total = 0u64;
+            let mut stack: Vec<DisplayObject<'_>> = vec![context.stage.into()];
+            while let Some(obj) = stack.pop() {
+                total += 1;
+                let kind = obj
+                    .object2()
+                    .map(|o| { use crate::avm2::object::TObject as _; let o: crate::avm2::Object<'_> = o.into(); o.instance_class().name().local_name().to_string() })
+                    .unwrap_or_else(|| "(no AS3 object)".to_string());
+                *kinds.entry(kind).or_default() += 1;
+                if let Some(container) = obj.as_container() {
+                    stack.extend(container.iter_render_list());
+                }
+            }
+            let mut kinds: Vec<(String, u64)> = kinds.into_iter().collect();
+            kinds.sort_by(|a, b| b.1.cmp(&a.1));
+            let kinds: Vec<serde_json::Value> = kinds
+                .into_iter()
+                .take(8)
+                .map(|(k, n)| serde_json::json!({ "kind": k, "count": n }))
+                .collect();
             serde_json::json!({
                 "gcObjects": gc_objects,
                 "movies": movie_list,
+                "displayObjects": total,
+                "displayKinds": kinds,
                 "orphans": context.orphan_manager.len(),
                 "weakDictionaries": context.avm2.weak_dictionary_count(),
                 "lastGcLibraries": last_gc_libraries,
@@ -2604,15 +2636,19 @@ impl Player {
     /// Update all AVM-based timers (such as created via setInterval).
     /// Returns the approximate amount of time until the next timer tick.
     pub fn update_timers(&mut self, dt: FloatDuration) {
+        let t = crate::frame_lifecycle::skua_stats::clock_us();
         self.time_til_next_timer =
             self.mutate_with_update_context(|context| Timers::update_timers(context, dt));
+        crate::frame_lifecycle::skua_stats::add_since(&crate::frame_lifecycle::skua_stats::TIMERS_US, t);
     }
 
     /// Update connected Sockets.
     pub fn update_sockets(&mut self) {
+        let t = crate::frame_lifecycle::skua_stats::clock_us();
         self.mutate_with_update_context(|context| {
             Sockets::update_sockets(context);
-        })
+        });
+        crate::frame_lifecycle::skua_stats::add_since(&crate::frame_lifecycle::skua_stats::SOCKETS_US, t);
     }
 
     /// Update connected NetConnections.
