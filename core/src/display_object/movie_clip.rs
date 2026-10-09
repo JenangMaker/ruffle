@@ -930,6 +930,7 @@ impl<'gc> MovieClip<'gc> {
                 // the current frame, the goto is properly queued.
 
                 self.0.queued_goto.set(Some(goto_info));
+                self.mark_frame_work();
 
                 // If we have a frame script on that frame, add ourselves to the
                 // frame script cleanup queue so that that frame script is
@@ -1395,6 +1396,7 @@ impl<'gc> MovieClip<'gc> {
         run_sounds: bool,
         is_action_script_3: bool,
     ) {
+        self.mark_frame_work();
         let shared = Gc::as_ref(self.0.shared.get());
 
         let next_frame = self.determine_next_frame();
@@ -1661,6 +1663,7 @@ impl<'gc> MovieClip<'gc> {
     }
 
     fn run_goto(mut self, context: &mut UpdateContext<'gc>, frame: FrameNumber, is_implicit: bool) {
+        self.mark_frame_work();
         if cfg!(feature = "timeline_debug") {
             tracing::debug!(
                 "[{}]: {} from frame {} to frame {}",
@@ -2165,6 +2168,7 @@ impl<'gc> MovieClip<'gc> {
         context: &mut UpdateContext<'gc>,
     ) {
         let current_frame = self.current_frame();
+        self.mark_frame_work();
 
         let write = unlock!(Gc::write(context.gc(), self.0), MovieClipData, cell);
         let mut frame_scripts = RefMut::map(write.borrow_mut(), |r| &mut r.frame_scripts);
@@ -2514,6 +2518,10 @@ impl<'gc> MovieClip<'gc> {
                     self.0
                         .set_flag(MovieClipFlags::EXECUTING_AVM2_FRAME_SCRIPT, false);
                 }
+            } else {
+                // Postponed until the running script is done: a later pass
+                // has to come back for it.
+                self.mark_frame_work();
             }
         }
 
@@ -2636,9 +2644,14 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
                     .0
                     .contains_flag(MovieClipFlags::RUNNING_CONSTRUCT_FRAME);
                 for child in self.iter_render_list() {
+                    if !child.frame_work_due() {
+                        continue;
+                    }
                     // Under some conditions, we won't run `construct_frame` on
                     // a not-yet-constructed child
                     if child.object2().is_none() {
+                        // Left for later: a later pass has to come back.
+                        child.mark_frame_work();
                         // Avoid running recursively- if `Sprite.constructChildren`
                         // was constructing this clip's children, and somehow
                         // a child's construction triggered another `construct_frame`
@@ -2659,7 +2672,13 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
 
                     child.construct_frame(context);
                 }
+            } else {
+                // Waiting for the Sprite constructor to construct the children.
+                self.mark_frame_work();
             }
+        } else if self.movie().is_action_script_3() {
+            // Not loaded yet: construct it once it is.
+            self.mark_frame_work();
         }
 
         if *context.frame_phase == FramePhase::Construct {
@@ -2673,7 +2692,9 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
         self.run_local_frame_scripts(context);
 
         for child in self.iter_render_list() {
-            child.run_frame_scripts(context);
+            if child.frame_work_due() {
+                child.run_frame_scripts(context);
+            }
         }
     }
 
