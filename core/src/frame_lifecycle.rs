@@ -20,6 +20,84 @@ use tracing::instrument;
 
 /// VibeSkua: goto counters for the desktop player's drawing summary. (Skipping
 /// the work of no-op gotos was tried and hung AQW: the game relies on it.)
+/// VibeSkua: which display objects a goto pass can skip.
+///
+/// Every AS3 goto (gotoAndStop and the like, no-op ones included) runs frame
+/// construction and frame scripts over the whole stage and the orphan list.
+/// AQW does this hundreds of times a frame in a fight, over a tree of several
+/// thousand objects, almost none of which have anything to do: that was most
+/// of the game thread's time.
+///
+/// Each display object keeps the number of the pass that was current when it
+/// last got frame work (a new child, a frame change, a goto, a new or
+/// postponed frame script), and its ancestors keep at least that number, so a
+/// subtree without newer work can be skipped. A goto pass visits what was
+/// marked since the start of the previous pass, or since the start of the
+/// outermost pass still running (a goto inside a frame script must still run
+/// the work that pass has not reached yet). Normal frames and walks outside any
+/// pass still visit everything. SKUA_FULL_GOTO=1 turns the skipping off.
+pub mod frame_work {
+    use std::cell::Cell;
+    use std::sync::OnceLock;
+
+    // Per thread: a player runs on one thread (the tests run several at once).
+    thread_local! {
+        static PASS: Cell<u64> = const { Cell::new(1) };
+        static THRESHOLD: Cell<u64> = const { Cell::new(0) };
+        static OPEN: Cell<u64> = const { Cell::new(u64::MAX) };
+    }
+
+    /// The pass number a new mark gets.
+    #[inline]
+    pub fn now() -> u64 {
+        PASS.get()
+    }
+
+    /// Objects marked before this pass number are skipped (0: nothing is).
+    #[inline]
+    pub fn threshold() -> u64 {
+        THRESHOLD.get()
+    }
+
+    fn disabled() -> bool {
+        static OFF: OnceLock<bool> = OnceLock::new();
+        *OFF.get_or_init(|| {
+            matches!(
+                std::env::var("SKUA_FULL_GOTO").as_deref(),
+                Ok("1" | "true" | "yes" | "on")
+            )
+        })
+    }
+
+    #[must_use]
+    pub struct Saved(u64, u64);
+
+    fn begin(threshold: impl FnOnce(u64, u64) -> u64) -> Saved {
+        let saved = Saved(THRESHOLD.get(), OPEN.get());
+        let before = PASS.get();
+        PASS.set(before + 1);
+        let threshold = threshold(saved.1, before);
+        OPEN.set(threshold);
+        THRESHOLD.set(threshold);
+        saved
+    }
+
+    /// A goto pass starts: skip what has had no work since the previous one.
+    pub fn begin_goto_pass() -> Saved {
+        begin(|open, before| if disabled() { 0 } else { open.min(before) })
+    }
+
+    /// A normal frame's construct and frame-script phases: visit everything.
+    pub fn begin_full_pass() -> Saved {
+        begin(|_, _| 0)
+    }
+
+    pub fn end_pass(saved: Saved) {
+        THRESHOLD.set(saved.0);
+        OPEN.set(saved.1);
+    }
+}
+
 pub mod skua_stats {
     use std::sync::atomic::AtomicU64;
 
@@ -170,6 +248,7 @@ pub fn run_all_phases_avm2(context: &mut UpdateContext<'_>) {
     skua_stats::add_since(&skua_stats::PHASE_US[0], t);
 
     let t = skua_stats::clock_us();
+    let pass = frame_work::begin_full_pass();
     *context.frame_phase = FramePhase::Construct;
     OrphanManager::each_orphan_obj(context, |orphan, context| {
         orphan.construct_frame(context);
@@ -185,6 +264,7 @@ pub fn run_all_phases_avm2(context: &mut UpdateContext<'_>) {
     });
     stage.run_frame_scripts(context);
     run_frame_script_cleanup(context);
+    frame_work::end_pass(pass);
     skua_stats::add_since(&skua_stats::PHASE_US[2], t);
 
     let t = skua_stats::clock_us();
@@ -242,9 +322,12 @@ pub fn run_inner_goto_frame<'gc>(
 
     // Note - we do *not* call `enter_frame` or dispatch an `enterFrame` event
 
+    let pass = frame_work::begin_goto_pass();
     *context.frame_phase = FramePhase::Construct;
     OrphanManager::each_orphan_obj(context, |orphan, context| {
-        orphan.construct_frame(context);
+        if orphan.frame_work_due() {
+            orphan.construct_frame(context);
+        }
     });
     stage.construct_frame(context);
     broadcast_frame_constructed(context);
@@ -252,7 +335,9 @@ pub fn run_inner_goto_frame<'gc>(
     *context.frame_phase = FramePhase::FrameScripts;
     stage.run_frame_scripts(context);
     OrphanManager::each_orphan_obj(context, |orphan, context| {
-        orphan.run_frame_scripts(context);
+        if orphan.frame_work_due() {
+            orphan.run_frame_scripts(context);
+        }
     });
 
     for child in removed_frame_scripts {
@@ -269,6 +354,7 @@ pub fn run_inner_goto_frame<'gc>(
     // a result of a RemoveObject tag - see `cleanup_dead_orphans` for details.
     context.orphan_manager.cleanup_dead_orphans(context.gc());
 
+    frame_work::end_pass(pass);
     *context.frame_phase = old_phase;
     #[cfg(not(target_family = "wasm"))]
     skua_stats::INNER_GOTO_US.fetch_add(

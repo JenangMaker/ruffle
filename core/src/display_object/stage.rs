@@ -862,7 +862,9 @@ impl<'gc> TDisplayObject<'gc> for Stage<'gc> {
 
     fn construct_frame(self, context: &mut UpdateContext<'gc>) {
         for child in self.iter_render_list() {
-            child.construct_frame(context);
+            if child.frame_work_due() {
+                child.construct_frame(context);
+            }
         }
     }
 

@@ -320,6 +320,10 @@ pub struct DisplayObjectBase<'gc> {
 
     /// Rectangle used for 9-slice scaling (`DisplayObject.scale9grid`).
     scaling_grid: Cell<Rectangle<Twips>>,
+
+    /// VibeSkua: the pass this object (or a descendant) last got frame work
+    /// in; see `frame_lifecycle::frame_work`.
+    frame_work_pass: Cell<u64>,
 }
 
 #[derive(Clone)]
@@ -365,6 +369,7 @@ impl Default for DisplayObjectBase<'_> {
             scroll_rect: Cell::new(None),
             next_scroll_rect: Default::default(),
             scaling_grid: Default::default(),
+            frame_work_pass: Cell::new(crate::frame_lifecycle::frame_work::now()),
         }
     }
 }
@@ -1933,6 +1938,11 @@ pub trait TDisplayObject<'gc>:
         DisplayObjectBase::set_parent_ignoring_orphan_list(write, parent);
         let parent_removed = had_parent && parent.is_none();
 
+        // A new or moved child has to be seen by the next goto pass, and its
+        // new ancestors may not carry its mark yet.
+        self.base().frame_work_pass.set(0);
+        self.mark_frame_work();
+
         if parent_removed {
             if let Some(int) = self.as_interactive() {
                 if crate::skua_stats::input_debug() && int.has_focus() {
@@ -1943,6 +1953,35 @@ pub trait TDisplayObject<'gc>:
 
             self.on_parent_removed(context);
         }
+    }
+
+    /// VibeSkua: this object has frame work (construction, frame scripts, a
+    /// queued goto) for the next goto pass; so do its ancestors, which lead
+    /// the pass to it.
+    #[no_dynamic]
+    fn mark_frame_work(self) {
+        let pass = crate::frame_lifecycle::frame_work::now();
+        let base = self.base();
+        if base.frame_work_pass.get() >= pass {
+            return;
+        }
+        base.frame_work_pass.set(pass);
+        let mut next = self.parent();
+        while let Some(obj) = next {
+            let base = obj.base();
+            if base.frame_work_pass.get() >= pass {
+                break;
+            }
+            base.frame_work_pass.set(pass);
+            next = obj.parent();
+        }
+    }
+
+    /// VibeSkua: whether the running goto pass has to visit this object.
+    #[no_dynamic]
+    #[inline]
+    fn frame_work_due(self) -> bool {
+        self.base().frame_work_pass.get() >= crate::frame_lifecycle::frame_work::threshold()
     }
 
     /// This method is called when the parent is removed.
@@ -2460,7 +2499,9 @@ pub trait TDisplayObject<'gc>:
     fn run_frame_scripts(self, context: &mut UpdateContext<'gc>) {
         if let Some(container) = self.as_container() {
             for child in container.iter_render_list() {
-                child.run_frame_scripts(context);
+                if child.frame_work_due() {
+                    child.run_frame_scripts(context);
+                }
             }
         }
     }
