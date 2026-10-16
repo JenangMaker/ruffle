@@ -2501,7 +2501,13 @@ impl Player {
         if full {
             // System.gc(): finish the cycle in progress (it may have marked
             // things before they became garbage), then run a whole fresh one.
-            Self::finish_gc_cycle(arena);
+            // With none in progress, finishing one already is a whole fresh
+            // cycle: a second found nothing more and cost as much again (AQW
+            // calls System.gc() on every map change; it was about a fifth of
+            // the player's main thread across room changes).
+            if arena.collection_phase() != CollectionPhase::Sleeping {
+                Self::finish_gc_cycle(arena);
+            }
             Self::finish_gc_cycle(arena);
             FULL_COLLECTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return;
