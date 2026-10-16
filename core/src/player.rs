@@ -2520,9 +2520,11 @@ impl Player {
     /// windows, and the removed clips on the orphan list, which still run on
     /// every frame.
     ///
-    /// When no cycle has ended for `RUFFLE_GC_MAX_CYCLE_SECONDS` (default 10;
+    /// When no cycle has ended for `RUFFLE_GC_MAX_CYCLE_SECONDS` (default 5;
     /// 0 turns this off), each frame gives the collector a slice of time,
-    /// `RUFFLE_GC_FRAME_BUDGET_MS` (default 1), until the cycle ends. A
+    /// `RUFFLE_GC_FRAME_BUDGET_MS` (default 3), until the cycle ends. On the
+    /// server (4 farming tabs, ~500k GC objects each) 10 s / 1 ms left about
+    /// twice the orphans of 5 s / 3 ms, at the same CPU. A
     /// sleeping collector is woken with the least debt that does it, so the
     /// first slice doesn't turn into one long pause.
     fn finish_overdue_gc_cycle(&mut self) {
@@ -3575,8 +3577,8 @@ fn gc_overdue_settings() -> Option<(std::time::Duration, std::time::Duration)> {
                 .and_then(|v| v.trim().parse::<f64>().ok())
                 .unwrap_or(default)
         };
-        let max_cycle = read("RUFFLE_GC_MAX_CYCLE_SECONDS", 10.0);
-        let budget_ms = read("RUFFLE_GC_FRAME_BUDGET_MS", 1.0);
+        let max_cycle = read("RUFFLE_GC_MAX_CYCLE_SECONDS", 5.0);
+        let budget_ms = read("RUFFLE_GC_FRAME_BUDGET_MS", 3.0);
         (max_cycle > 0.0 && budget_ms > 0.0).then(|| {
             (
                 std::time::Duration::from_secs_f64(max_cycle),
