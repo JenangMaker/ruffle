@@ -336,14 +336,6 @@ impl ActivePlayer {
             .with_player_version(opt.player.player_version)
             .with_player_runtime(opt.player.player_runtime.unwrap_or_default())
             .with_frame_rate(opt.player.frame_rate)
-            // VibeSkua: check what is under an idle mouse every
-            // `RUFFLE_IDLE_PICK_MS` (default 100; 0: after every update).
-            .with_idle_pick_interval(std::time::Duration::from_millis(
-                std::env::var("RUFFLE_IDLE_PICK_MS")
-                    .ok()
-                    .and_then(|v| v.trim().parse().ok())
-                    .unwrap_or(100),
-            ))
             .with_avm2_optimizer_enabled(opt.avm2_optimizer_enabled);
         let player = builder.build();
 
