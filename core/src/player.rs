@@ -355,6 +355,11 @@ pub struct Player {
 
     gc_arena: Rc<RefCell<GcArena>>,
 
+    /// When the last GC cycle ended, and whether one is under way (see
+    /// `finish_overdue_gc_cycle`).
+    gc_cycle_ended: Instant,
+    gc_cycle_running: bool,
+
     frame_rate: f64,
     forced_frame_rate: bool,
     actions_since_timeout_check: u32,
@@ -585,6 +590,7 @@ impl Player {
 
             self.frame_accumulator -= frame_duration;
             frame += 1;
+            self.finish_overdue_gc_cycle();
             // The script probably tried implementing an FPS limiter with a busy loop.
             // We fooled the busy loop by pretending that more time has passed that actually did.
             // Then we need to actually pass this time, by decreasing frame_accumulator
@@ -2491,8 +2497,69 @@ impl Player {
         } else if let Some(marked) = arena.mark_debt() {
             let resurrected = marked.finalize(|fc, root| Self::finalize_weak_references(fc, root));
             if !resurrected {
+                // Weak references were just settled for this marking: dead
+                // dictionary keys, weak listeners and unused libraries are gone.
+                // Start the sweep now. Left "marked", the heap would let the
+                // next update upgrade a weak pointer to an object that is dead
+                // (and so mark it live again) although what it relies on was
+                // removed above.
+                if let Some(marked) = arena.finish_marking() {
+                    marked.start_sweeping();
+                }
                 arena.cycle_debt();
             }
+        }
+    }
+
+    /// Keeps GC cycles from taking minutes.
+    ///
+    /// gc-arena does collection work in proportion to allocation, and after a
+    /// cycle sleeps until the heap has grown by half. AQW's heap is large and
+    /// grows slowly, so on one map a cycle can take minutes, and until it ends
+    /// nothing unreachable is freed: avatars of players who left, closed
+    /// windows, and the removed clips on the orphan list, which still run on
+    /// every frame.
+    ///
+    /// When no cycle has ended for `RUFFLE_GC_MAX_CYCLE_SECONDS` (default 10;
+    /// 0 turns this off), each frame gives the collector a slice of time,
+    /// `RUFFLE_GC_FRAME_BUDGET_MS` (default 1), until the cycle ends. A
+    /// sleeping collector is woken with the least debt that does it, so the
+    /// first slice doesn't turn into one long pause.
+    fn finish_overdue_gc_cycle(&mut self) {
+        let Some((max_cycle, budget)) = gc_overdue_settings() else {
+            return;
+        };
+        let mut arena = self.gc_arena.borrow_mut();
+        if arena.collection_phase() == CollectionPhase::Sleeping {
+            if self.gc_cycle_running {
+                self.gc_cycle_running = false;
+                self.gc_cycle_ended = Instant::now();
+            }
+        } else {
+            self.gc_cycle_running = true;
+        }
+        if self.gc_cycle_ended.elapsed() < max_cycle {
+            return;
+        }
+
+        let start = Instant::now();
+        if arena.collection_phase() == CollectionPhase::Sleeping {
+            wake_collector(arena.metrics());
+        }
+        // Small steps, so the time check stays close to the budget.
+        const STEP: f64 = 4096.0;
+        loop {
+            Self::collect_garbage(&mut arena);
+            if arena.collection_phase() == CollectionPhase::Sleeping {
+                self.gc_cycle_running = false;
+                self.gc_cycle_ended = Instant::now();
+                break;
+            }
+            self.gc_cycle_running = true;
+            if start.elapsed() >= budget {
+                break;
+            }
+            arena.metrics().adjust_debt(STEP);
         }
     }
 
@@ -3251,6 +3318,9 @@ impl PlayerBuilder {
                 swf: fake_movie.clone(),
                 current_frame: None,
 
+                gc_cycle_ended: Instant::now(),
+                gc_cycle_running: false,
+
                 // Timing
                 frame_rate,
                 forced_frame_rate,
@@ -3491,4 +3561,61 @@ pub enum PlayerMode {
 
     /// Represents the debug version of Flash Player, i.e. flashplayerdebugger.
     Debug,
+}
+
+/// `finish_overdue_gc_cycle`'s settings: the longest a cycle may take before
+/// it gets time each frame, and how much time; `None` when turned off.
+fn gc_overdue_settings() -> Option<(std::time::Duration, std::time::Duration)> {
+    static SETTINGS: std::sync::OnceLock<Option<(std::time::Duration, std::time::Duration)>> =
+        std::sync::OnceLock::new();
+    *SETTINGS.get_or_init(|| {
+        let read = |name: &str, default: f64| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.trim().parse::<f64>().ok())
+                .unwrap_or(default)
+        };
+        let max_cycle = read("RUFFLE_GC_MAX_CYCLE_SECONDS", 10.0);
+        let budget_ms = read("RUFFLE_GC_FRAME_BUDGET_MS", 1.0);
+        (max_cycle > 0.0 && budget_ms > 0.0).then(|| {
+            (
+                std::time::Duration::from_secs_f64(max_cycle),
+                std::time::Duration::from_secs_f64(budget_ms / 1000.0),
+            )
+        })
+    })
+}
+
+/// Adds the least artificial debt that ends the collector's sleep: in the
+/// sleeping phase the debt reads zero until it passes the wake-up point, and
+/// anything beyond that point is collection work the next step would do at
+/// once. Found by trying amounts and taking each back (doubling, then halving
+/// the gap).
+fn wake_collector(metrics: &gc_arena::metrics::Metrics) {
+    let wakes = |amount: f64| {
+        metrics.adjust_debt(amount);
+        let woke = metrics.allocation_debt() > 0.0;
+        metrics.adjust_debt(-amount);
+        woke
+    };
+    if metrics.allocation_debt() > 0.0 {
+        return;
+    }
+    let mut high = 1024.0;
+    while !wakes(high) {
+        high *= 2.0;
+        if high > 1e15 {
+            return;
+        }
+    }
+    let mut low = high / 2.0;
+    for _ in 0..24 {
+        let mid = (low + high) / 2.0;
+        if wakes(mid) {
+            high = mid;
+        } else {
+            low = mid;
+        }
+    }
+    metrics.adjust_debt(high);
 }
