@@ -77,6 +77,10 @@ impl<'gc> DispatchObject<'gc> {
         .into()
     }
 
+    pub fn downgrade(self) -> DispatchObjectWeak<'gc> {
+        DispatchObjectWeak(Gc::downgrade(self.0))
+    }
+
     pub fn dispatch_mut(self, mc: &Mutation<'gc>) -> RefMut<'gc, DispatchList<'gc>> {
         unlock!(Gc::write(mc, self.0), DispatchObjectData, dispatch).borrow_mut()
     }

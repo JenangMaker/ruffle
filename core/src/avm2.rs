@@ -176,6 +176,10 @@ pub struct Avm2<'gc> {
     /// Behind a lock because finalization only gets a shared reference.
     weak_dictionaries: GcRefLock<'gc, Vec<DictionaryObjectWeak<'gc>>>,
 
+    /// Every live dispatch list that has had a weak listener, for
+    /// `prune_weak_listeners`. Behind a lock for the same reason.
+    weak_listener_lists: GcRefLock<'gc, Vec<object::DispatchObjectWeak<'gc>>>,
+
     /// Set by `System.gc()`; the player runs a full collection after the
     /// current update.
     #[collect(require_static)]
@@ -238,6 +242,7 @@ impl<'gc> Avm2<'gc> {
             native_fast_call_list: Default::default(),
             broadcast_list: Default::default(),
             weak_dictionaries: GcRefLock::new(mc, Vec::new().into()),
+            weak_listener_lists: GcRefLock::new(mc, Vec::new().into()),
             full_gc_requested: Cell::new(false),
 
             alias_to_class_map: Default::default(),
@@ -254,6 +259,39 @@ impl<'gc> Avm2<'gc> {
 
             optimizer_enabled: true,
         }
+    }
+
+    pub fn weak_listener_list_count(&self) -> usize {
+        self.weak_listener_lists.borrow().len()
+    }
+
+    pub fn register_weak_listener_list(
+        &self,
+        mc: &Mutation<'gc>,
+        list: object::DispatchObjectWeak<'gc>,
+    ) {
+        self.weak_listener_lists.borrow_mut(mc).push(list);
+    }
+
+    /// Last finalization pass, once nothing more is resurrected: drops the
+    /// weak listeners whose function is about to be collected, and forgets
+    /// the lists that are themselves about to be collected.
+    pub fn prune_weak_listeners(&self, fc: &gc_arena::Finalization<'gc>) {
+        let live: Vec<_> = self
+            .weak_listener_lists
+            .borrow()
+            .iter()
+            .filter(|l| !l.0.is_dead(fc))
+            .filter_map(|l| l.0.upgrade(fc))
+            .collect();
+        for data in live {
+            object::DispatchObject(data)
+                .dispatch_mut(fc)
+                .remove_dead_weak_listeners(fc);
+        }
+        self.weak_listener_lists
+            .borrow_mut(fc)
+            .retain(|l| !l.0.is_dead(fc));
     }
 
     pub fn weak_dictionary_count(&self) -> usize {

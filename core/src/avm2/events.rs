@@ -9,6 +9,7 @@ use crate::display_object::TDisplayObject;
 use crate::string::AvmString;
 use fnv::FnvHashMap;
 use gc_arena::Collect;
+use gc_arena::collect::Trace;
 use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 
@@ -167,14 +168,32 @@ impl<'gc> Event<'gc> {
 }
 
 /// A set of handlers organized by event type, priority, and order added.
+///
+/// The second field says whether a weak listener was ever added, so the list
+/// is registered for `Avm2::prune_weak_listeners` only once.
 #[derive(Clone, Collect)]
 #[collect(no_drop)]
-pub struct DispatchList<'gc>(FnvHashMap<AvmString<'gc>, BTreeMap<i32, Vec<EventHandler<'gc>>>>);
+pub struct DispatchList<'gc>(
+    FnvHashMap<AvmString<'gc>, BTreeMap<i32, Vec<EventHandler<'gc>>>>,
+    bool,
+);
 
 impl<'gc> DispatchList<'gc> {
     /// Construct a new dispatch list.
     pub fn new() -> Self {
-        Self(Default::default())
+        Self(Default::default(), false)
+    }
+
+    /// Removes the weak listeners whose function is about to be collected.
+    /// Only valid during finalization, once nothing more gets resurrected:
+    /// weak listeners aren't traced, so this must run before every sweep that
+    /// could free one.
+    pub fn remove_dead_weak_listeners(&mut self, fc: &gc_arena::Finalization<'gc>) {
+        for sheaf in self.0.values_mut() {
+            for handlers in sheaf.values_mut() {
+                handlers.retain(|h| !(h.weak && gc_arena::Gc::is_dead(fc, h.handler.0)));
+            }
+        }
     }
 
     /// Get all of the event handlers for a given event type, if such a type
@@ -220,19 +239,25 @@ impl<'gc> DispatchList<'gc> {
         priority: i32,
         handler: FunctionObject<'gc>,
         use_capture: bool,
-    ) {
-        let new_handler = EventHandler::new(handler, use_capture);
+        weak: bool,
+    ) -> bool {
+        let new_handler = EventHandler::new(handler, use_capture, weak);
 
         if let Some(event_sheaf) = self.get_event(event) {
             for other_set in event_sheaf.values() {
                 if other_set.contains(&new_handler) {
-                    return;
+                    return false;
                 }
             }
         }
 
         self.get_event_priority_mut(event, priority)
             .push(new_handler);
+
+        // The caller registers the list the first time it gets a weak listener.
+        let first_weak = weak && !self.1;
+        self.1 |= weak;
+        first_weak
     }
 
     /// Remove an event handler from this dispatch list.
@@ -245,7 +270,7 @@ impl<'gc> DispatchList<'gc> {
         handler: FunctionObject<'gc>,
         use_capture: bool,
     ) {
-        let old_handler = EventHandler::new(handler, use_capture);
+        let old_handler = EventHandler::new(handler, use_capture, false);
 
         for set in self.get_event_mut(event).values_mut() {
             if let Some(pos) = set.iter().position(|h| *h == old_handler) {
@@ -306,8 +331,7 @@ impl Default for DispatchList<'_> {
 }
 
 /// A single instance of an event handler.
-#[derive(Clone, Collect)]
-#[collect(no_drop)]
+#[derive(Clone)]
 struct EventHandler<'gc> {
     /// The event handler to call.
     handler: FunctionObject<'gc>,
@@ -316,13 +340,32 @@ struct EventHandler<'gc> {
     /// (when `true`), or if it should only be called for bubbling and
     /// at-target events (when `false`).
     use_capture: bool,
+
+    /// Added with `useWeakReference`: as in Flash, the listener doesn't keep
+    /// its function alive. A method closure is cached on its object, so it
+    /// lives as long as the object does; an anonymous function lives only
+    /// while something else holds it.
+    weak: bool,
+}
+
+// SAFETY: a weak handler's function is not traced. Before any sweep that
+// could free it, `DispatchList::remove_dead_weak_listeners` drops it from
+// every registered list (`Avm2::prune_weak_listeners`), so no list ever
+// holds a freed function.
+unsafe impl<'gc> Collect<'gc> for EventHandler<'gc> {
+    fn trace<C: Trace<'gc>>(&self, cc: &mut C) {
+        if !self.weak {
+            cc.trace(&self.handler);
+        }
+    }
 }
 
 impl<'gc> EventHandler<'gc> {
-    fn new(handler: FunctionObject<'gc>, use_capture: bool) -> Self {
+    fn new(handler: FunctionObject<'gc>, use_capture: bool, weak: bool) -> Self {
         Self {
             handler,
             use_capture,
+            weak,
         }
     }
 }

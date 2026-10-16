@@ -2560,6 +2560,7 @@ impl Player {
                 "displayKinds": kinds,
                 "orphans": context.orphan_manager.len(),
                 "weakDictionaries": context.avm2.weak_dictionary_count(),
+                "weakListenerLists": context.avm2.weak_listener_list_count(),
                 "lastGcLibraries": last_gc_libraries,
             })
             .to_string()
@@ -2584,6 +2585,7 @@ impl Player {
         if !resurrected {
             let mut data = root.data.borrow_mut(fc);
             data.avm2.prune_weak_dictionaries(fc);
+            data.avm2.prune_weak_listeners(fc);
             data.library.drop_unused_movie_libraries(fc);
         }
         resurrected

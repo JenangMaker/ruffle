@@ -25,6 +25,16 @@ fn dispatch_list<'gc>(
     }
 }
 
+/// `useWeakReference` is honoured unless `RUFFLE_WEAK_LISTENERS=0`, which keeps
+/// every listener strong (Ruffle's old behaviour), in case some content turns
+/// out to rely on a weak listener staying alive.
+fn weak_listeners_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("RUFFLE_WEAK_LISTENERS").map_or(true, |v| v.trim() != "0")
+    })
+}
+
 /// Implements `EventDispatcher.addEventListener`.
 pub fn add_event_listener<'gc>(
     activation: &mut Activation<'_, 'gc>,
@@ -38,12 +48,18 @@ pub fn add_event_listener<'gc>(
     let listener = args.get_function(activation, 1, "listener")?;
     let use_capture = args.get_bool(2);
     let priority = args.get_i32(3);
+    let weak = args.get_bool(4) && weak_listeners_enabled();
 
-    //TODO: If we ever get weak GC references, we should respect `useWeakReference`.
-    dispatch_list
+    let first_weak = dispatch_list
         .as_dispatch_mut(activation.gc())
         .expect("Internal properties should have what I put in them")
-        .add_event_listener(event_type, priority, listener, use_capture);
+        .add_event_listener(event_type, priority, listener, use_capture, weak);
+    if first_weak && let Some(dispatch) = dispatch_list.as_dispatch_object() {
+        let mc = activation.gc();
+        activation
+            .avm2()
+            .register_weak_listener_list(mc, dispatch.downgrade());
+    }
 
     Avm2::register_broadcast_listener(activation.context, this, event_type);
 
