@@ -1071,11 +1071,13 @@ pub fn log_memory_stats(stats_json: &str) {
         })
         .unwrap_or_default();
     tracing::warn!(
-        "skua bridge: memory: rss {} MB ({}), {} GC objects, {} orphans; {} SWFs alive ({:.1} MB): {}; last GC libraries: {} collectable, {} dropped, kept by {}",
+        "skua bridge: memory: rss {} MB ({}), {} GC objects, {} orphans, GC cycles {} (overdue help {} ms, totals); {} SWFs alive ({:.1} MB): {}; last GC libraries: {} collectable, {} dropped, kept by {}",
         rss_mb,
         rss_split(),
         v["gcObjects"],
         v["orphans"],
+        v["gcCycles"],
+        v["gcHelpMs"],
         count,
         bytes as f64 / 1048576.0,
         top,

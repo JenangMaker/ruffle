@@ -314,6 +314,11 @@ enum RunState {
 /// after one (malloc_trim).
 pub static FULL_COLLECTIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// GC cycles finished, and the time given to overdue ones (`finish_overdue_gc_cycle`), in
+/// microseconds, in every player of this process; for the memory stats.
+static GC_CYCLES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GC_HELP_MICROS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub struct Player {
     /// The version of the player we're emulating.
     ///
@@ -359,6 +364,8 @@ pub struct Player {
     /// `finish_overdue_gc_cycle`).
     gc_cycle_ended: Instant,
     gc_cycle_running: bool,
+    /// When an overdue cycle was last given time; `None` when it isn't overdue.
+    gc_helped: Option<Instant>,
 
     frame_rate: f64,
     forced_frame_rate: bool,
@@ -2482,6 +2489,14 @@ impl Player {
     /// be finalized (`Player::finalize_weak_references`) before the sweep;
     /// if that resurrects anything, marking resumes on a later call.
     fn collect_garbage(arena: &mut GcArena) {
+        let was_sleeping = arena.collection_phase() == CollectionPhase::Sleeping;
+        Self::collect_garbage_inner(arena);
+        if !was_sleeping && arena.collection_phase() == CollectionPhase::Sleeping {
+            GC_CYCLES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn collect_garbage_inner(arena: &mut GcArena) {
         let full = arena.mutate(|_, root| root.data.borrow().avm2.take_full_gc_request());
         if full {
             // System.gc(): finish the cycle in progress (it may have marked
@@ -2521,14 +2536,15 @@ impl Player {
     /// every frame.
     ///
     /// When no cycle has ended for `RUFFLE_GC_MAX_CYCLE_SECONDS` (default 5;
-    /// 0 turns this off), each frame gives the collector a slice of time,
-    /// `RUFFLE_GC_FRAME_BUDGET_MS` (default 3), until the cycle ends. On the
-    /// server (4 farming tabs, ~500k GC objects each) 10 s / 1 ms left about
-    /// twice the orphans of 5 s / 3 ms, at the same CPU. A
-    /// sleeping collector is woken with the least debt that does it, so the
-    /// first slice doesn't turn into one long pause.
+    /// 0 turns this off), each frame gives the collector a share of the time
+    /// since the last frame, `RUFFLE_GC_TIME_SHARE` percent (default 2), until
+    /// the cycle ends. A share of time, not a fixed slice per frame: hidden
+    /// and headless tabs run 1-2 frames a second, where the earlier 3 ms a
+    /// frame was only 3-6 ms of collecting a second and an overdue cycle still
+    /// took long. A sleeping collector is woken with the least debt that does
+    /// it, so the first slice doesn't turn into one long pause.
     fn finish_overdue_gc_cycle(&mut self) {
-        let Some((max_cycle, budget)) = gc_overdue_settings() else {
+        let Some((max_cycle, share)) = gc_overdue_settings() else {
             return;
         };
         let mut arena = self.gc_arena.borrow_mut();
@@ -2541,10 +2557,19 @@ impl Player {
             self.gc_cycle_running = true;
         }
         if self.gc_cycle_ended.elapsed() < max_cycle {
+            self.gc_helped = None;
             return;
         }
 
         let start = Instant::now();
+        // The time since the last help (the first one counts one frame's
+        // worth), at most a second, so a stalled player doesn't pause long.
+        let since = self.gc_helped.map_or_else(
+            || std::time::Duration::from_secs_f64(1.0 / self.frame_rate.max(1.0)),
+            |t| start.duration_since(t),
+        );
+        let budget = since.min(std::time::Duration::from_secs(1)).mul_f64(share);
+        self.gc_helped = Some(start);
         if arena.collection_phase() == CollectionPhase::Sleeping {
             wake_collector(arena.metrics());
         }
@@ -2563,6 +2588,10 @@ impl Player {
             }
             arena.metrics().adjust_debt(STEP);
         }
+        GC_HELP_MICROS.fetch_add(
+            start.elapsed().as_micros() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     /// A snapshot for hunting memory leaks, as JSON: live GC objects, the SWF
@@ -2628,6 +2657,8 @@ impl Player {
                 "displayObjects": total,
                 "displayKinds": kinds,
                 "orphans": context.orphan_manager.len(),
+                "gcCycles": GC_CYCLES.load(std::sync::atomic::Ordering::Relaxed),
+                "gcHelpMs": GC_HELP_MICROS.load(std::sync::atomic::Ordering::Relaxed) / 1000,
                 "weakDictionaries": context.avm2.weak_dictionary_count(),
                 "weakListenerLists": context.avm2.weak_listener_list_count(),
                 "lastGcLibraries": last_gc_libraries,
@@ -3322,6 +3353,7 @@ impl PlayerBuilder {
 
                 gc_cycle_ended: Instant::now(),
                 gc_cycle_running: false,
+                gc_helped: None,
 
                 // Timing
                 frame_rate,
@@ -3566,9 +3598,10 @@ pub enum PlayerMode {
 }
 
 /// `finish_overdue_gc_cycle`'s settings: the longest a cycle may take before
-/// it gets time each frame, and how much time; `None` when turned off.
-fn gc_overdue_settings() -> Option<(std::time::Duration, std::time::Duration)> {
-    static SETTINGS: std::sync::OnceLock<Option<(std::time::Duration, std::time::Duration)>> =
+/// it gets time each frame, and the share of time it gets (0-1); `None` when
+/// turned off.
+fn gc_overdue_settings() -> Option<(std::time::Duration, f64)> {
+    static SETTINGS: std::sync::OnceLock<Option<(std::time::Duration, f64)>> =
         std::sync::OnceLock::new();
     *SETTINGS.get_or_init(|| {
         let read = |name: &str, default: f64| {
@@ -3578,13 +3611,9 @@ fn gc_overdue_settings() -> Option<(std::time::Duration, std::time::Duration)> {
                 .unwrap_or(default)
         };
         let max_cycle = read("RUFFLE_GC_MAX_CYCLE_SECONDS", 5.0);
-        let budget_ms = read("RUFFLE_GC_FRAME_BUDGET_MS", 3.0);
-        (max_cycle > 0.0 && budget_ms > 0.0).then(|| {
-            (
-                std::time::Duration::from_secs_f64(max_cycle),
-                std::time::Duration::from_secs_f64(budget_ms / 1000.0),
-            )
-        })
+        let share = read("RUFFLE_GC_TIME_SHARE", 2.0).min(50.0) / 100.0;
+        (max_cycle > 0.0 && share > 0.0)
+            .then(|| (std::time::Duration::from_secs_f64(max_cycle), share))
     })
 }
 
