@@ -1254,11 +1254,23 @@ async fn request_device(
             label: None,
             required_features: features,
             required_limits: limits,
-            memory_hints: Default::default(),
+            memory_hints: memory_hints(),
             trace: wgpu::Trace::Off,
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
         })
         .await
+}
+
+/// How wgpu sizes the memory blocks it suballocates from. Its default
+/// (Performance) reserves blocks of 128-256 MB: about 290 MB a player at
+/// AQW's login screen, so four players ran a 512 MB integrated GPU out of
+/// memory. MemoryUsage starts at 8 MB blocks. RUFFLE_GPU_MEMORY=performance
+/// restores wgpu's default.
+fn memory_hints() -> wgpu::MemoryHints {
+    match std::env::var("RUFFLE_GPU_MEMORY").as_deref() {
+        Ok("performance") => wgpu::MemoryHints::Performance,
+        _ => wgpu::MemoryHints::MemoryUsage,
+    }
 }
 
 /// Determines how we choose our frame buffer
