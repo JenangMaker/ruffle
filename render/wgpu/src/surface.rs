@@ -197,6 +197,7 @@ impl Surface {
         nearest_layer: LayerRef<'encoder>,
         texture_pool: &'encoder mut TexturePool,
     ) -> CommandTarget {
+        let opaque = matches!(&render_target_mode, RenderTargetMode::FreshWithColor(color) if color.a >= 1.0);
         let target = CommandTarget::new(
             descriptors,
             texture_pool,
@@ -437,6 +438,7 @@ impl Surface {
             },
             texture_pool,
             Some(&mut execute),
+            opaque,
         );
         for chunk in chunks {
             execute(chunk, staging_belt, draw_encoder, texture_pool);

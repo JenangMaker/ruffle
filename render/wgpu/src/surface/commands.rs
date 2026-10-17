@@ -674,8 +674,9 @@ pub fn chunk_blends<'encoder, 'global: 'encoder>(
     nearest_layer: LayerRef<'encoder>,
     texture_pool: &'encoder mut TexturePool,
     sink: Option<ChunkSink<'encoder, 'global>>,
+    opaque: bool,
 ) -> Vec<Chunk> {
-    WgpuCommandHandler::new(
+    let mut handler = WgpuCommandHandler::new(
         descriptors,
         staging_belt,
         dynamic_transforms,
@@ -687,8 +688,9 @@ pub fn chunk_blends<'encoder, 'global: 'encoder>(
         nearest_layer,
         texture_pool,
         sink,
-    )
-    .chunk_blends(commands)
+    );
+    handler.opaque = opaque;
+    handler.chunk_blends(commands)
 }
 
 struct WgpuCommandHandler<'encoder, 'global: 'encoder> {
@@ -704,6 +706,9 @@ struct WgpuCommandHandler<'encoder, 'global: 'encoder> {
     texture_pool: &'encoder mut TexturePool,
     emulate_lines: bool,
     sink: Option<ChunkSink<'encoder, 'global>>,
+    /// VibeSkua: the target was cleared to an opaque colour (the stage), so
+    /// it stays opaque: Multiply is then a plain hardware blend.
+    opaque: bool,
 
     result: Vec<Chunk>,
     current: Vec<DrawCommand>,
@@ -749,6 +754,7 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
             texture_pool,
             emulate_lines,
             sink,
+            opaque: false,
 
             result: vec![],
             current: vec![],
@@ -949,7 +955,12 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
         } else {
             self.nearest_layer
         };
-        let blend_type = BlendType::from(blend_mode);
+        let blend_type = match BlendType::from(blend_mode) {
+            BlendType::Complex(ComplexBlend::Multiply) if self.opaque => {
+                BlendType::Trivial(TrivialBlend::Multiply)
+            }
+            blend_type => blend_type,
+        };
         let clear_color = blend_type.default_color();
         let target = surface.draw_commands(
             RenderTargetMode::FreshWithColor(clear_color),
