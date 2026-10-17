@@ -174,6 +174,10 @@ impl MainWindow {
 
                 use ruffle_core::events::MouseButton as RuffleMouseButton;
                 use winit::event::MouseButton;
+                #[cfg(windows)]
+                if state == ElementState::Pressed {
+                    crate::backends::skua_bridge::take_focus_if_embedded(self.gui.window());
+                }
                 let (x, y) = self.gui.window_to_movie_position(self.mouse_pos);
                 let button = match button {
                     MouseButton::Left => RuffleMouseButton::Left,

@@ -68,7 +68,7 @@ ashpd = { version = "0.13.0", features = ["settings", "game_mode"] }
 
 [target.'cfg(windows)'.dependencies]
 # VibeSkua: the Skua bridge also uses Foundation, WinSock, ProcessStatus and Threading
-windows-sys = { version = "0.61.2", features = ["Win32_System_Console", "Win32_Storage_FileSystem", "Win32_Foundation", "Win32_Networking_WinSock", "Win32_System_ProcessStatus", "Win32_System_Threading"] }
+windows-sys = { version = "0.61.2", features = ["Win32_System_Console", "Win32_Storage_FileSystem", "Win32_Foundation", "Win32_Networking_WinSock", "Win32_System_ProcessStatus", "Win32_System_Threading", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
 
 [build-dependencies]
 vergen = { version = "10.0.3", features = ["build", "cargo"] }

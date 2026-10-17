@@ -77,6 +77,29 @@ pub fn set_window(window: &winit::window::Window) {
     }
 }
 
+/// Windows: gives the keyboard to the player window when it is embedded (a
+/// child of Skua's window, in another process). A click there activates the
+/// top-level window, which keeps the focus: nothing moves it to the child, so
+/// the game got no keys. Parenting joined the two processes' input, so the
+/// child may take the focus itself; called on each mouse press.
+#[cfg(windows)]
+pub fn take_focus_if_embedded(window: &winit::window::Window) {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GWL_STYLE, GetWindowLongPtrW, WS_CHILD};
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let Ok(RawWindowHandle::Win32(handle)) = window.window_handle().map(|h| h.as_raw()) else {
+        return;
+    };
+    let hwnd = handle.hwnd.get() as windows_sys::Win32::Foundation::HWND;
+    // SAFETY: plain Win32 calls on our own window's handle.
+    unsafe {
+        let child = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32 & WS_CHILD != 0;
+        if child && GetFocus() != hwnd {
+            SetFocus(hwnd);
+        }
+    }
+}
+
 /// Whether drawing is paused: the window then asks for no redraws at all.
 pub fn drawing_paused() -> bool {
     DRAWING_PAUSED.load(Ordering::Relaxed)
