@@ -29,6 +29,22 @@ pub struct CommandRenderer<'encoder> {
     mask_state: MaskState,
     needs_stencil: bool,
     dynamic_vertex_buffer: &'encoder wgpu::Buffer,
+    state: PassStateCache,
+}
+
+/// VibeSkua: what this pass last set, so the same pipeline, bind group,
+/// buffers or stencil reference are not set again for the next draw. Every
+/// shape draw set all of them: ~15,500 commands a frame in AQW's Battleon
+/// with filters off, and wgpu checks and records each one when the command
+/// buffer is finished (most of a frame's drawing time on Windows). Starts
+/// empty for each pass.
+#[derive(Default)]
+struct PassStateCache {
+    pipeline: std::cell::Cell<usize>,
+    group2: std::cell::Cell<usize>,
+    vertex: std::cell::Cell<(usize, u64, u64)>,
+    index: std::cell::Cell<(usize, u64, u64)>,
+    stencil: std::cell::Cell<Option<u32>>,
 }
 
 impl<'encoder> CommandRenderer<'encoder> {
@@ -48,6 +64,45 @@ impl<'encoder> CommandRenderer<'encoder> {
             descriptors,
             needs_stencil,
             dynamic_vertex_buffer,
+            state: PassStateCache::default(),
+        }
+    }
+
+    fn set_pipeline(&self, render_pass: &mut wgpu::RenderPass<'encoder>, pipeline: &'encoder wgpu::RenderPipeline) {
+        let key = pipeline as *const _ as usize;
+        if self.state.pipeline.replace(key) != key {
+            render_pass.set_pipeline(pipeline);
+        }
+    }
+
+    fn set_group2(&self, render_pass: &mut wgpu::RenderPass<'encoder>, bind_group: &'encoder wgpu::BindGroup) {
+        let key = bind_group as *const _ as usize;
+        if self.state.group2.replace(key) != key {
+            render_pass.set_bind_group(2, bind_group, &[]);
+        }
+    }
+
+    fn set_stencil(&self, render_pass: &mut wgpu::RenderPass<'encoder>, reference: u32) {
+        if self.state.stencil.replace(Some(reference)) != Some(reference) {
+            render_pass.set_stencil_reference(reference);
+        }
+    }
+
+    fn set_buffers(
+        &self,
+        render_pass: &mut wgpu::RenderPass<'encoder>,
+        vertices: &'encoder wgpu::Buffer,
+        vertex_range: std::ops::Range<wgpu::BufferAddress>,
+        indices: &'encoder wgpu::Buffer,
+        index_range: std::ops::Range<wgpu::BufferAddress>,
+    ) {
+        let key = (vertices as *const _ as usize, vertex_range.start, vertex_range.end);
+        if self.state.vertex.replace(key) != key {
+            render_pass.set_vertex_buffer(0, vertices.slice(vertex_range));
+        }
+        let key = (indices as *const _ as usize, index_range.start, index_range.end);
+        if self.state.index.replace(key) != key {
+            render_pass.set_index_buffer(indices.slice(index_range), wgpu::IndexFormat::Uint32);
         }
     }
 
@@ -60,13 +115,13 @@ impl<'encoder> CommandRenderer<'encoder> {
             match self.mask_state {
                 MaskState::NoMask => {}
                 MaskState::DrawMaskStencil => {
-                    render_pass.set_stencil_reference(self.num_masks - 1);
+                    self.set_stencil(render_pass, self.num_masks - 1);
                 }
                 MaskState::DrawMaskedContent => {
-                    render_pass.set_stencil_reference(self.num_masks);
+                    self.set_stencil(render_pass, self.num_masks);
                 }
                 MaskState::ClearMaskStencil => {
-                    render_pass.set_stencil_reference(self.num_masks);
+                    self.set_stencil(render_pass, self.num_masks);
                 }
             }
         }
@@ -122,17 +177,17 @@ impl<'encoder> CommandRenderer<'encoder> {
 
     pub fn prep_color(&self, render_pass: &mut wgpu::RenderPass<'encoder>) {
         if self.needs_stencil {
-            render_pass.set_pipeline(self.pipelines.color.pipeline_for(self.mask_state));
+            self.set_pipeline(render_pass, self.pipelines.color.pipeline_for(self.mask_state));
         } else {
-            render_pass.set_pipeline(self.pipelines.color.stencilless_pipeline());
+            self.set_pipeline(render_pass, self.pipelines.color.stencilless_pipeline());
         }
     }
 
     pub fn prep_lines(&self, render_pass: &mut wgpu::RenderPass<'encoder>) {
         if self.needs_stencil {
-            render_pass.set_pipeline(self.pipelines.lines.pipeline_for(self.mask_state));
+            self.set_pipeline(render_pass, self.pipelines.lines.pipeline_for(self.mask_state));
         } else {
-            render_pass.set_pipeline(self.pipelines.lines.stencilless_pipeline());
+            self.set_pipeline(render_pass, self.pipelines.lines.stencilless_pipeline());
         }
     }
 
@@ -142,12 +197,12 @@ impl<'encoder> CommandRenderer<'encoder> {
         bind_group: &'encoder wgpu::BindGroup,
     ) {
         if self.needs_stencil {
-            render_pass.set_pipeline(self.pipelines.gradients.pipeline_for(self.mask_state));
+            self.set_pipeline(render_pass, self.pipelines.gradients.pipeline_for(self.mask_state));
         } else {
-            render_pass.set_pipeline(self.pipelines.gradients.stencilless_pipeline());
+            self.set_pipeline(render_pass, self.pipelines.gradients.stencilless_pipeline());
         }
 
-        render_pass.set_bind_group(2, bind_group, &[]);
+        self.set_group2(render_pass, bind_group);
     }
 
     pub fn prep_bitmap(
@@ -159,21 +214,20 @@ impl<'encoder> CommandRenderer<'encoder> {
     ) {
         match (self.needs_stencil, render_stage3d) {
             (true, true) => {
-                render_pass.set_pipeline(&self.pipelines.bitmap_opaque_dummy_stencil);
+                self.set_pipeline(render_pass, &self.pipelines.bitmap_opaque_dummy_stencil);
             }
             (true, false) => {
-                render_pass
-                    .set_pipeline(self.pipelines.bitmap[blend_mode].pipeline_for(self.mask_state));
+                self.set_pipeline(render_pass, self.pipelines.bitmap[blend_mode].pipeline_for(self.mask_state));
             }
             (false, true) => {
-                render_pass.set_pipeline(&self.pipelines.bitmap_opaque);
+                self.set_pipeline(render_pass, &self.pipelines.bitmap_opaque);
             }
             (false, false) => {
-                render_pass.set_pipeline(self.pipelines.bitmap[blend_mode].stencilless_pipeline());
+                self.set_pipeline(render_pass, self.pipelines.bitmap[blend_mode].stencilless_pipeline());
             }
         }
 
-        render_pass.set_bind_group(2, bind_group, &[]);
+        self.set_group2(render_pass, bind_group);
     }
 
     pub fn prep_alpha_mask(
@@ -182,24 +236,26 @@ impl<'encoder> CommandRenderer<'encoder> {
         bind_group: &'encoder wgpu::BindGroup,
     ) {
         if self.needs_stencil {
-            render_pass.set_pipeline(self.pipelines.alpha_mask.pipeline_for(self.mask_state));
+            self.set_pipeline(render_pass, self.pipelines.alpha_mask.pipeline_for(self.mask_state));
         } else {
-            render_pass.set_pipeline(self.pipelines.alpha_mask.stencilless_pipeline());
+            self.set_pipeline(render_pass, self.pipelines.alpha_mask.stencilless_pipeline());
         }
 
-        render_pass.set_bind_group(2, bind_group, &[]);
+        self.set_group2(render_pass, bind_group);
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn draw(
         &self,
         render_pass: &mut wgpu::RenderPass<'encoder>,
-        vertices: wgpu::BufferSlice<'encoder>,
-        indices: wgpu::BufferSlice<'encoder>,
+        vertices: &'encoder wgpu::Buffer,
+        vertex_range: std::ops::Range<wgpu::BufferAddress>,
+        indices: &'encoder wgpu::Buffer,
+        index_range: std::ops::Range<wgpu::BufferAddress>,
         num_indices: u32,
         instance_index: u32,
     ) {
-        render_pass.set_vertex_buffer(0, vertices);
-        render_pass.set_index_buffer(indices, wgpu::IndexFormat::Uint32);
+        self.set_buffers(render_pass, vertices, vertex_range, indices, index_range);
 
         render_pass.draw_indexed(0..num_indices, 0, instance_index..(instance_index + 1));
     }
@@ -228,16 +284,22 @@ impl<'encoder> CommandRenderer<'encoder> {
         );
         self.prep_bitmap(render_pass, &bind.bind_group, blend_mode, render_stage3d);
 
-        let vertex_slice = if let Some(vertex_offset) = vertex_offset {
-            self.dynamic_vertex_buffer.slice(vertex_offset..)
+        let (vertex_buffer, vertex_range) = if let Some(vertex_offset) = vertex_offset {
+            (
+                self.dynamic_vertex_buffer,
+                vertex_offset..self.dynamic_vertex_buffer.size(),
+            )
         } else {
-            self.descriptors.quad.vertices_pos_uv.slice(..)
+            let quad = &self.descriptors.quad.vertices_pos_uv;
+            (quad, 0..quad.size())
         };
 
         self.draw(
             render_pass,
-            vertex_slice,
-            self.descriptors.quad.indices.slice(..),
+            vertex_buffer,
+            vertex_range,
+            &self.descriptors.quad.indices,
+            0..self.descriptors.quad.indices.size(),
             6,
             instance_index,
         );
@@ -254,8 +316,10 @@ impl<'encoder> CommandRenderer<'encoder> {
 
         self.draw(
             render_pass,
-            self.descriptors.quad.vertices_pos_uv.slice(..),
-            self.descriptors.quad.indices.slice(..),
+            &self.descriptors.quad.vertices_pos_uv,
+            0..self.descriptors.quad.vertices_pos_uv.size(),
+            &self.descriptors.quad.indices,
+            0..self.descriptors.quad.indices.size(),
             6,
             instance_index,
         );
@@ -295,8 +359,10 @@ impl<'encoder> CommandRenderer<'encoder> {
 
             self.draw(
                 render_pass,
-                mesh.vertex_buffer.slice(draw.vertices.clone()),
-                mesh.index_buffer.slice(draw.indices.clone()),
+                &mesh.vertex_buffer,
+                draw.vertices.clone(),
+                &mesh.index_buffer,
+                draw.indices.clone(),
                 num_indices,
                 instance_index,
             );
@@ -319,8 +385,10 @@ impl<'encoder> CommandRenderer<'encoder> {
 
         self.draw(
             render_pass,
-            self.descriptors.quad.vertices_pos.slice(..),
-            self.descriptors.quad.indices.slice(..),
+            &self.descriptors.quad.vertices_pos,
+            0..self.descriptors.quad.vertices_pos.size(),
+            &self.descriptors.quad.indices,
+            0..self.descriptors.quad.indices.size(),
             6,
             instance_index,
         );
@@ -335,8 +403,10 @@ impl<'encoder> CommandRenderer<'encoder> {
 
         self.draw(
             render_pass,
-            self.descriptors.quad.vertices_pos_color.slice(..),
-            self.descriptors.quad.indices.slice(..),
+            &self.descriptors.quad.vertices_pos_color,
+            0..self.descriptors.quad.vertices_pos_color.size(),
+            &self.descriptors.quad.indices,
+            0..self.descriptors.quad.indices.size(),
             6,
             instance_index,
         );
@@ -351,11 +421,17 @@ impl<'encoder> CommandRenderer<'encoder> {
 
         self.draw(
             render_pass,
-            self.descriptors.quad.vertices_pos_color.slice(..),
+            &self.descriptors.quad.vertices_pos_color,
+            0..self.descriptors.quad.vertices_pos_color.size(),
             if RECT {
-                self.descriptors.quad.indices_line_rect.slice(..)
+                &self.descriptors.quad.indices_line_rect
             } else {
-                self.descriptors.quad.indices_line.slice(..)
+                &self.descriptors.quad.indices_line
+            },
+            0..if RECT {
+                self.descriptors.quad.indices_line_rect.size()
+            } else {
+                self.descriptors.quad.indices_line.size()
             },
             if RECT { 5 } else { 2 },
             instance_index,
@@ -368,25 +444,25 @@ impl<'encoder> CommandRenderer<'encoder> {
         );
         self.num_masks += 1;
         self.mask_state = MaskState::DrawMaskStencil;
-        render_pass.set_stencil_reference(self.num_masks - 1);
+        self.set_stencil(render_pass, self.num_masks - 1);
     }
 
     pub fn activate_mask(&mut self, render_pass: &mut wgpu::RenderPass<'encoder>) {
         debug_assert!(self.num_masks > 0 && self.mask_state == MaskState::DrawMaskStencil);
         self.mask_state = MaskState::DrawMaskedContent;
-        render_pass.set_stencil_reference(self.num_masks);
+        self.set_stencil(render_pass, self.num_masks);
     }
 
     pub fn deactivate_mask(&mut self, render_pass: &mut wgpu::RenderPass<'encoder>) {
         debug_assert!(self.num_masks > 0 && self.mask_state == MaskState::DrawMaskedContent);
         self.mask_state = MaskState::ClearMaskStencil;
-        render_pass.set_stencil_reference(self.num_masks);
+        self.set_stencil(render_pass, self.num_masks);
     }
 
     pub fn pop_mask(&mut self, render_pass: &mut wgpu::RenderPass<'encoder>) {
         debug_assert!(self.num_masks > 0 && self.mask_state == MaskState::ClearMaskStencil);
         self.num_masks -= 1;
-        render_pass.set_stencil_reference(self.num_masks);
+        self.set_stencil(render_pass, self.num_masks);
         if self.num_masks == 0 {
             self.mask_state = MaskState::NoMask;
         } else {
