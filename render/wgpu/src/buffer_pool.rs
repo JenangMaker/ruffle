@@ -12,11 +12,42 @@ type Constructor<Type, Description> = Box<dyn Fn(&Descriptors, &Description) -> 
 pub struct TexturePool {
     pools: FnvHashMap<TextureKey, BufferPool<(wgpu::Texture, wgpu::TextureView), AlwaysCompatible>>,
     globals_cache: FnvHashMap<GlobalsKey, Arc<Globals>>,
+    // VibeSkua: the frame each size was last used in (see `end_frame`).
+    frame: u64,
+    last_used: FnvHashMap<TextureKey, u64>,
+    globals_last_used: FnvHashMap<GlobalsKey, u64>,
 }
 
 impl TexturePool {
     pub fn new() -> Self {
         Default::default()
+    }
+
+    /// VibeSkua: ends a frame, dropping the textures of sizes not used in the
+    /// last `keep_frames` frames. The offscreen pool was emptied after every
+    /// frame instead: with filters on, AQW's animated characters need filter
+    /// and cache scratch textures in slightly different sizes each frame,
+    /// hundreds of textures made and destroyed a frame. Sizes repeat as the
+    /// animations loop, so most are now reused.
+    pub fn end_frame(&mut self, keep_frames: u64) {
+        let frame = self.frame;
+        self.frame += 1;
+        let pools = &mut self.pools;
+        self.last_used.retain(|key, used| {
+            let keep = frame - *used <= keep_frames;
+            if !keep {
+                pools.remove(key);
+            }
+            keep
+        });
+        let globals = &mut self.globals_cache;
+        self.globals_last_used.retain(|key, used| {
+            let keep = frame - *used <= keep_frames;
+            if !keep {
+                globals.remove(key);
+            }
+            keep
+        });
     }
 
     pub fn get_texture(
@@ -33,6 +64,7 @@ impl TexturePool {
             format,
             sample_count,
         };
+        self.last_used.insert(key, self.frame);
         let pool = self.pools.entry(key).or_insert_with(|| {
             let label = if cfg!(feature = "render_debug_labels") {
                 use std::sync::atomic::{AtomicU32, Ordering};
@@ -66,11 +98,13 @@ impl TexturePool {
         viewport_width: u32,
         viewport_height: u32,
     ) -> Arc<Globals> {
+        let key = GlobalsKey {
+            viewport_width,
+            viewport_height,
+        };
+        self.globals_last_used.insert(key, self.frame);
         self.globals_cache
-            .entry(GlobalsKey {
-                viewport_width,
-                viewport_height,
-            })
+            .entry(key)
             .or_insert_with(|| {
                 Arc::new(Globals::new(
                     &descriptors.device,

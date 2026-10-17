@@ -83,6 +83,7 @@ pub struct WgpuRenderBackend<T: RenderTarget> {
     dynamic_transforms: DynamicTransforms,
     active_frame: ActiveFrame,
     profiler: GpuProfiler,
+    last_frame: Option<wgpu::SubmissionIndex>,
 }
 
 impl WgpuRenderBackend<SwapChainTarget> {
@@ -280,6 +281,7 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             dynamic_transforms: transforms,
             active_frame,
             profiler,
+            last_frame: None,
         })
     }
 
@@ -526,6 +528,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
     }
 
     fn set_quality(&mut self, quality: StageQuality) {
+        let quality = capped_quality(quality);
         self.surface = Surface::new(
             &self.descriptors,
             quality,
@@ -688,9 +691,23 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             .resolve_queries(&mut self.active_frame.command_encoder);
         self.active_frame.staging_belt.finish();
 
-        self.active_frame
+        let index = self
+            .active_frame
             .submit_for_target(&self.descriptors, &self.target, frame_output);
-        self.offscreen_texture_pool = TexturePool::new();
+        // VibeSkua: scratch textures are kept while their sizes are in use,
+        // about two seconds at AQW's 24 frames a second (see end_frame).
+        self.offscreen_texture_pool.end_frame(48);
+        // VibeSkua: at most two frames in flight. Nothing waited for the GPU,
+        // so when it fell behind (filters on, an integrated GPU) frames queued
+        // up with every texture they use: 100 MB more a second until wgpu ran
+        // out of memory, measured on a 512 MB AMD iGPU.
+        #[cfg(not(target_family = "wasm"))]
+        if let Some(previous) = self.last_frame.replace(index) {
+            let _ = self.descriptors.device.poll(wgpu::PollType::Wait {
+                submission_index: Some(previous),
+                timeout: None,
+            });
+        }
         self.profiler
             .end_frame()
             .expect("Frame should end successfully");
@@ -1378,6 +1395,26 @@ impl ActiveFrame {
         if self.draws_since_flush > Self::MAX_DRAWS_PER_FLUSH {
             self.submit_direct(descriptors);
         }
+    }
+}
+
+/// VibeSkua: RUFFLE_MAX_QUALITY (low, medium, high, ...) caps the
+/// anti-aliasing a movie can ask for with `stage.quality`; the movie still
+/// reads back the quality it set. AQW sets HIGH (4x MSAA) whatever the
+/// player started with: each blended or filtered object is then drawn 4x,
+/// and each break in the stage's render pass (a complex blend needs one)
+/// resolves the whole stage. Battleon with filters on: 108-118 ms of an
+/// integrated GPU a frame at HIGH, 29 ms at MEDIUM.
+fn capped_quality(quality: StageQuality) -> StageQuality {
+    static CAP: std::sync::OnceLock<Option<StageQuality>> = std::sync::OnceLock::new();
+    let cap = CAP.get_or_init(|| {
+        std::env::var("RUFFLE_MAX_QUALITY")
+            .ok()
+            .and_then(|v| v.trim().to_ascii_lowercase().parse().ok())
+    });
+    match cap {
+        Some(cap) if quality.sample_count() > cap.sample_count() => *cap,
+        _ => quality,
     }
 }
 
