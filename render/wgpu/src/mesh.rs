@@ -19,6 +19,10 @@ pub struct Mesh {
     pub draws: Vec<Draw>,
     pub vertex_buffer: wgpu::Buffer,
     pub index_buffer: wgpu::Buffer,
+    /// VibeSkua: the vertices' bounding box in the shape's own pixels
+    /// (min x, min y, max x, max y), None for a shape without vertices.
+    /// Complex blends use it to work on the blended object's area only.
+    pub bounds: Option<[f32; 4]>,
 }
 
 impl ShapeHandleImpl for Mesh {}

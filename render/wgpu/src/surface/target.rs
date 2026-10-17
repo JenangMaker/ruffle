@@ -1,3 +1,4 @@
+use super::commands::BlendRect;
 use crate::backend::RenderTargetMode;
 use crate::buffer_pool::{AlwaysCompatible, PoolEntry, TexturePool};
 use crate::descriptors::Descriptors;
@@ -423,6 +424,56 @@ impl CommandTarget {
                 aspect: Default::default(),
             },
             self.frame_buffer.size(),
+        );
+        blend_buffer
+    }
+
+    /// VibeSkua: copies `rect` of the target into a texture of its own size,
+    /// for a complex blend drawn with its viewport on `rect` (see `BlendRect`).
+    pub fn blend_buffer_for_rect(
+        &self,
+        descriptors: &Descriptors,
+        pool: &mut TexturePool,
+        encoder: &mut wgpu::CommandEncoder,
+        rect: BlendRect,
+    ) -> BlendBuffer {
+        let size = wgpu::Extent3d {
+            width: rect.width,
+            height: rect.height,
+            depth_or_array_layers: 1,
+        };
+        let blend_buffer = BlendBuffer::new(
+            descriptors,
+            size,
+            self.format,
+            wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::COPY_SRC,
+            pool,
+        );
+        self.ensure_cleared(encoder);
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: self
+                    .resolve_buffer
+                    .as_ref()
+                    .map(|b| b.texture())
+                    .unwrap_or_else(|| self.frame_buffer.texture()),
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: rect.x,
+                    y: rect.y,
+                    z: 0,
+                },
+                aspect: Default::default(),
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: blend_buffer.texture(),
+                mip_level: 0,
+                origin: Default::default(),
+                aspect: Default::default(),
+            },
+            size,
         );
         blend_buffer
     }

@@ -294,6 +294,16 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             self.shape_tessellator
                 .tessellate_shape_with_scale(shape, bitmap_source, scale);
 
+        let bounds = lyon_mesh
+            .draws
+            .iter()
+            .flat_map(|draw| draw.vertices.iter())
+            .fold(None, |b: Option<[f32; 4]>, v| {
+                Some(match b {
+                    None => [v.x, v.y, v.x, v.y],
+                    Some([x0, y0, x1, y1]) => [x0.min(v.x), y0.min(v.y), x1.max(v.x), y1.max(v.y)],
+                })
+            });
         let mut draws = Vec::with_capacity(lyon_mesh.draws.len());
         let mut uniform_buffer = BufferBuilder::new(
             &self.descriptors.limits,
@@ -351,6 +361,7 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             draws,
             vertex_buffer,
             index_buffer,
+            bounds,
         }
     }
 

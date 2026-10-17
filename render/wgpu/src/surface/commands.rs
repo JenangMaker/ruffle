@@ -11,7 +11,7 @@ use crate::surface::target::CommandTarget;
 use crate::{Descriptors, MaskState, Pipelines, PosUvVertex, Transforms, as_texture};
 use ruffle_render::backend::ShapeHandle;
 use ruffle_render::bitmap::{BitmapHandle, PixelRegion, PixelSnapping};
-use ruffle_render::commands::{CommandHandler, CommandList, RenderBlendMode};
+use ruffle_render::commands::{Command, CommandHandler, CommandList, RenderBlendMode};
 use ruffle_render::lines::{emulate_line, emulate_line_rect};
 use ruffle_render::matrix::Matrix;
 use ruffle_render::pixel_bender::PixelBenderShaderHandle;
@@ -414,7 +414,167 @@ pub enum Chunk {
         texture: PoolOrArcTexture,
         blend_mode: ChunkBlendMode,
         needs_stencil: bool,
+        /// The area the blend can change; None for all of the target.
+        rect: Option<BlendRect>,
     },
+}
+
+/// VibeSkua: the part of a target a blend works on, in its pixels.
+///
+/// Each blended object (Multiply, Overlay, Screen, Add, ...) was drawn into a
+/// fresh texture the size of the whole target, and a complex blend copied all
+/// of the parent and ran its shader over all of it. AQW's Battleon blends
+/// about 240 small objects a frame on a 1000 x 666 stage: ~330 full-size
+/// passes, 100-200 ms of an integrated GPU a frame (5 fps). Now the object is
+/// drawn into a texture of its own bounds, shifted there, and composited back
+/// over that area only. Outside the object the result is the parent as it
+/// was (transparent pixels add nothing, and complex blend shaders discard
+/// them), so the picture is the same.
+#[derive(Clone, Copy, Debug)]
+pub struct BlendRect {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Screen-space bounds of drawn commands, in target pixels.
+struct CommandBounds {
+    min: (f32, f32),
+    max: (f32, f32),
+}
+
+impl CommandBounds {
+    fn new() -> Self {
+        Self {
+            min: (f32::INFINITY, f32::INFINITY),
+            max: (f32::NEG_INFINITY, f32::NEG_INFINITY),
+        }
+    }
+
+    fn add_rect(&mut self, matrix: &Matrix, [x0, y0, x1, y1]: [f32; 4]) {
+        let (tx, ty) = (matrix.tx.to_pixels() as f32, matrix.ty.to_pixels() as f32);
+        for (x, y) in [(x0, y0), (x1, y0), (x0, y1), (x1, y1)] {
+            let px = matrix.a * x + matrix.c * y + tx;
+            let py = matrix.b * x + matrix.d * y + ty;
+            self.min = (self.min.0.min(px), self.min.1.min(py));
+            self.max = (self.max.0.max(px), self.max.1.max(py));
+        }
+    }
+
+    /// Adds what `commands` draw; false if that is not known (3D, Stage3D).
+    fn add(&mut self, commands: &[Command]) -> bool {
+        for command in commands {
+            let known = match command {
+                Command::RenderShape { shape, transform } => {
+                    transform.perspective_projection.is_none()
+                        && as_mesh(shape).bounds.is_none_or(|bounds| {
+                            self.add_rect(&transform.matrix, bounds);
+                            true
+                        })
+                }
+                Command::RenderBitmap {
+                    transform, region, ..
+                } => {
+                    let matrix = transform.matrix
+                        * Matrix::scale(region.width() as f32, region.height() as f32);
+                    self.add_rect(&matrix, [0.0, 0.0, 1.0, 1.0]);
+                    transform.perspective_projection.is_none()
+                }
+                Command::RenderStage3D { .. } => false,
+                Command::RenderAlphaMask {
+                    maskee_commands,
+                    mask_commands,
+                } => self.add(&maskee_commands.commands) && self.add(&mask_commands.commands),
+                Command::DrawRect { matrix, .. }
+                | Command::DrawLine { matrix, .. }
+                | Command::DrawLineRect { matrix, .. } => {
+                    self.add_rect(matrix, [0.0, 0.0, 1.0, 1.0]);
+                    true
+                }
+                Command::PushMask
+                | Command::ActivateMask
+                | Command::DeactivateMask
+                | Command::PopMask => true,
+                Command::Blend(commands, _) => self.add(&commands.commands),
+            };
+            if !known {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Moves what `commands` draw by (-dx, -dy), onto a blend texture whose
+/// top left corner is at (dx, dy) of its parent.
+fn translate_commands(commands: &mut [Command], dx: Twips, dy: Twips) {
+    let shift = |matrix: &mut Matrix| {
+        matrix.tx = Twips::new(matrix.tx.get() - dx.get());
+        matrix.ty = Twips::new(matrix.ty.get() - dy.get());
+    };
+    for command in commands {
+        match command {
+            Command::RenderBitmap { transform, .. }
+            | Command::RenderStage3D { transform, .. }
+            | Command::RenderShape { transform, .. } => shift(&mut transform.matrix),
+            Command::RenderAlphaMask {
+                maskee_commands,
+                mask_commands,
+            } => {
+                translate_commands(&mut maskee_commands.commands, dx, dy);
+                translate_commands(&mut mask_commands.commands, dx, dy);
+            }
+            Command::DrawRect { matrix, .. }
+            | Command::DrawLine { matrix, .. }
+            | Command::DrawLineRect { matrix, .. } => shift(matrix),
+            Command::PushMask
+            | Command::ActivateMask
+            | Command::DeactivateMask
+            | Command::PopMask => {}
+            Command::Blend(commands, _) => translate_commands(&mut commands.commands, dx, dy),
+        }
+    }
+}
+
+/// The area of a `width` x `height` target that `commands` can change, with a
+/// margin for pixel snapping, line widths and smoothing. None: all of it (the
+/// bounds are not known, or the area is most of the target anyway).
+/// Some with a zero size: they draw nothing on the target.
+fn blend_rect(commands: &CommandList, width: u32, height: u32) -> Option<BlendRect> {
+    let mut bounds = CommandBounds::new();
+    if !bounds.add(&commands.commands) {
+        return None;
+    }
+    const MARGIN: f32 = 2.0;
+    let clamp = |v: f32, max: u32| (v.max(0.0) as u32).min(max);
+    let x0 = clamp((bounds.min.0 - MARGIN).floor(), width);
+    let y0 = clamp((bounds.min.1 - MARGIN).floor(), height);
+    let x1 = clamp((bounds.max.0 + MARGIN).ceil(), width);
+    let y1 = clamp((bounds.max.1 + MARGIN).ceil(), height);
+    if !(bounds.min.0 <= bounds.max.0 && bounds.min.1 <= bounds.max.1) || x1 <= x0 || y1 <= y0 {
+        return Some(BlendRect {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+        });
+    }
+    // Sizes in steps of 64 (or the whole width or height), so the pooled
+    // textures are reused rather than made for every object size.
+    let step = |size: u32, max: u32| size.div_ceil(64).saturating_mul(64).min(max);
+    let (rect_width, rect_height) = (step(x1 - x0, width), step(y1 - y0, height));
+    let rect = BlendRect {
+        x: x0.min(width - rect_width),
+        y: y0.min(height - rect_height),
+        width: rect_width,
+        height: rect_height,
+    };
+    // Close to the whole target: not worth a partial copy.
+    if rect.width as u64 * rect.height as u64 * 4 > width as u64 * height as u64 * 3 {
+        return None;
+    }
+    Some(rect)
 }
 
 #[derive(Debug)]
@@ -757,11 +917,31 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
             commands.execute(self);
             return;
         }
+        // Alpha and Erase change their layer outside the object too.
+        let rect = match BlendType::from(blend_mode.clone()) {
+            BlendType::Complex(ComplexBlend::Alpha | ComplexBlend::Erase) => None,
+            BlendType::Complex(_) | BlendType::Trivial(_) => {
+                blend_rect(&commands, self.width, self.height)
+            }
+            BlendType::Shader(_) => None,
+        };
+        let mut commands = commands;
+        if let Some(rect) = rect {
+            if rect.width == 0 {
+                // Off the target or empty: blending nothing changes nothing.
+                return;
+            }
+            translate_commands(
+                &mut commands.commands,
+                Twips::from_pixels_i32(rect.x as i32),
+                Twips::from_pixels_i32(rect.y as i32),
+            );
+        }
         let surface = Surface::new(
             self.descriptors,
             self.quality,
-            self.width,
-            self.height,
+            rect.map_or(self.width, |rect| rect.width),
+            rect.map_or(self.height, |rect| rect.height),
             wgpu::TextureFormat::Rgba8Unorm,
         );
         let target_layer = if let RenderBlendMode::Builtin(BlendMode::Layer) = &blend_mode {
@@ -798,8 +978,13 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
 
         match blend_type {
             BlendType::Trivial(blend_mode) => {
+                let mut matrix = Matrix::scale(target.width() as f32, target.height() as f32);
+                if let Some(rect) = rect {
+                    matrix.tx = Twips::from_pixels_i32(rect.x as i32);
+                    matrix.ty = Twips::from_pixels_i32(rect.y as i32);
+                }
                 let transform = Transform {
-                    matrix: Matrix::scale(target.width() as f32, target.height() as f32),
+                    matrix,
                     tz: 0.0,
                     color_transform: Default::default(),
                     perspective_projection: None,
@@ -861,6 +1046,7 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
                     texture: target.take_color_texture(),
                     blend_mode: chunk_blend_mode,
                     needs_stencil: self.num_masks > 0,
+                    rect,
                 };
                 self.push_chunk(chunk);
                 self.needs_stencil = self.num_masks > 0;
