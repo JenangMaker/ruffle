@@ -83,6 +83,15 @@ fn panic_hook(info: &PanicHookInfo) {
 
     let message = info.payload_as_str().unwrap_or("panic occurred");
 
+    // VibeSkua: driven by Skua (the Skua bridge), nobody is there to answer a
+    // dialog, and it would keep the dead player open. Exit instead (the default
+    // hook above has logged the panic), so Skua's NativeGame starts it again;
+    // also when the panic is on another thread than the event loop's.
+    if std::env::var_os("SKUA_BRIDGE_URL").is_some() {
+        eprintln!("skua bridge: fatal error, exiting: {message}");
+        std::process::exit(101);
+    }
+
     if rfd::MessageDialog::new()
         .set_level(rfd::MessageLevel::Error)
         .set_title("Ruffle")
