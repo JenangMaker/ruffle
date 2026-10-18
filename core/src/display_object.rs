@@ -841,6 +841,19 @@ impl<'gc> DisplayObjectBase<'gc> {
         RefMut::map(self.cell.borrow_mut(), |c| &mut c.cache)
     }
 
+    /// VibeSkua: drops the cacheAsBitmap texture, if any (drawn again when
+    /// next needed); whether there was one. See `Player::release_render_resources`.
+    pub fn drop_bitmap_cache_texture(&self) -> bool {
+        match self.bitmap_cache_mut().as_mut() {
+            Some(cache) => {
+                let had = cache.bitmap.is_some();
+                cache.clear();
+                had
+            }
+            None => false,
+        }
+    }
+
     /// Invalidates a cached bitmap, if it exists.
     /// This may only be called once per frame - the first call will return true, regardless of
     /// if there was a cache.

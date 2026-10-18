@@ -896,6 +896,20 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         )
     }
 
+    fn release_unused(&mut self) {
+        // The frame's scratch textures (filters, blends, masks) and, unless
+        // offscreen work is still pending, the offscreen ones. Kept between
+        // frames for reuse, they stayed allocated for as long as a hidden or
+        // headless tab drew nothing.
+        self.texture_pool = TexturePool::new();
+        self.trim_offscreen_pool();
+        // Let the GPU finish with them, so their memory is freed now.
+        let _ = self.descriptors.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
+    }
+
     fn is_offscreen_supported(&self) -> bool {
         offscreen_effects()
     }
