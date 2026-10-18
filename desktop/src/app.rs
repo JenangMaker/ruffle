@@ -434,6 +434,16 @@ impl MainWindow {
                     player.tick(dt);
                     crate::backends::skua_bridge::note_time("tick", tick_started.elapsed());
                     crate::backends::skua_bridge::trim_after_full_gc();
+                    // VibeSkua: a hidden or headless tab hands back what only
+                    // drawing needs (see release_due).
+                    if crate::backends::skua_bridge::release_due() {
+                        let started = Instant::now();
+                        let (caches, meshes) = player.release_render_resources();
+                        tracing::warn!(
+                            "skua bridge: drawing paused 10 s: released {caches} cached bitmaps, the meshes of {meshes} shapes and the renderer's scratch textures ({} ms)",
+                            started.elapsed().as_millis()
+                        );
+                    }
                     if crate::backends::skua_bridge::memory_stats_due() {
                         crate::backends::skua_bridge::log_memory_stats(&player.debug_stats());
                     }

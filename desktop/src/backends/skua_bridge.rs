@@ -43,6 +43,37 @@ const LOAD_CLIENT: &str = r#"{"id":-1,"fn":"loadClient","args":[]}"#;
 /// Drawing control (the page's maxRenderFps): paused draws nothing; the cap
 /// is frames drawn per second, 0 for no cap. The game runs either way.
 static DRAWING_PAUSED: AtomicBool = AtomicBool::new(false);
+/// When drawing was paused (`Instant` of the process start + ms), 0 while
+/// drawing; and whether that pause's resources were released (release_due).
+static PAUSED_AT_MS: AtomicU64 = AtomicU64::new(0);
+static PAUSE_RELEASED: AtomicBool = AtomicBool::new(false);
+
+fn clock_ms() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64 + 1
+}
+
+fn set_paused(paused: bool) {
+    let was = DRAWING_PAUSED.swap(paused, Ordering::Relaxed);
+    if paused && !was {
+        PAUSED_AT_MS.store(clock_ms(), Ordering::Relaxed);
+        PAUSE_RELEASED.store(false, Ordering::Relaxed);
+    } else if !paused {
+        PAUSED_AT_MS.store(0, Ordering::Relaxed);
+    }
+}
+
+/// True once per pause, when drawing has been paused (a hidden or headless
+/// tab) for 10 s: then the player hands back what only drawing needs
+/// (`Player::release_render_resources`). Not at once: switching between tabs
+/// pauses and resumes them, and everything released is made again on the
+/// first frame drawn.
+pub fn release_due() -> bool {
+    let at = PAUSED_AT_MS.load(Ordering::Relaxed);
+    at != 0
+        && clock_ms().saturating_sub(at) >= 10_000
+        && !PAUSE_RELEASED.swap(true, Ordering::Relaxed)
+}
 static RENDER_CAP_FPS: AtomicU32 = AtomicU32::new(0);
 static LAST_RENDER: Mutex<Option<Instant>> = Mutex::new(None);
 /// The game's current frame rate (stage.frameRate) in hundredths of a frame a
@@ -830,7 +861,7 @@ fn page_call(name: &str, args: &[ExternalValue]) -> Result<Json, String> {
     match name {
         "pauseDrawing" => {
             let paused = matches!(args.first(), Some(ExternalValue::Bool(true)));
-            DRAWING_PAUSED.store(paused, Ordering::Relaxed);
+            set_paused(paused);
             Ok(Json::Bool(true))
         }
         "setRender" => {
@@ -840,7 +871,7 @@ fn page_call(name: &str, args: &[ExternalValue]) -> Result<Json, String> {
                         RENDER_CAP_FPS.store(*fps as u32, Ordering::Relaxed)
                     }
                     Some(ExternalValue::Number(fps)) if *fps <= 0.0 => {
-                        DRAWING_PAUSED.store(true, Ordering::Relaxed)
+                        set_paused(true)
                     }
                     Some(_) => RENDER_CAP_FPS.store(0, Ordering::Relaxed),
                     None => {}

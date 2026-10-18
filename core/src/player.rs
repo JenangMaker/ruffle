@@ -2606,6 +2606,35 @@ impl Player {
     /// Dictionaries. A movie stays alive as long as anything references it,
     /// so a map or asset that keeps appearing here after it was replaced has
     /// leaked.
+    /// VibeSkua: hands back what only drawing needs, once nothing has been
+    /// drawn for a while (a hidden or headless tab): every cacheAsBitmap
+    /// texture on the stage (with filters on AQW caches most characters and
+    /// their effects), every shape's meshes, and the renderer's scratch
+    /// textures. On the iGPUs this matters most for, GPU memory is RAM. All of
+    /// it is made again on the first frame drawn afterwards. Returns how many
+    /// cached textures and shapes' meshes were dropped.
+    pub fn release_render_resources(&mut self) -> (usize, usize) {
+        fn drop_caches(object: crate::display_object::DisplayObject<'_>) -> usize {
+            use crate::display_object::{TDisplayObject, TDisplayObjectContainer};
+            let mut dropped = object.base().drop_bitmap_cache_texture() as usize;
+            if let Some(container) = object.as_container() {
+                for child in container.iter_render_list() {
+                    dropped += drop_caches(child);
+                }
+            }
+            dropped
+        }
+        let dropped = self.mutate_with_update_context(|context| {
+            let caches = drop_caches(context.stage.into());
+            let meshes = context
+                .library
+                .expire_idle_meshes(crate::display_object::mesh_clock_ms(), 0);
+            (caches, meshes)
+        });
+        self.renderer.release_unused();
+        dropped
+    }
+
     pub fn debug_stats(&mut self) -> String {
         let gc_objects = self.gc_arena.borrow().metrics().total_gc_count();
         self.mutate_with_update_context(|context| {
