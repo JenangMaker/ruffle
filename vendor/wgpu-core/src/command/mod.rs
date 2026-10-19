@@ -9,6 +9,7 @@
 //! state tracking, like [`InnerCommandEncoder`].
 
 mod allocator;
+pub use allocator::release_free_command_pools;
 mod bind;
 mod bundle;
 mod clear;
