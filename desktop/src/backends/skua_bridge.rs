@@ -69,8 +69,14 @@ fn set_paused(paused: bool) {
 /// pauses and resumes them, and everything released is made again on the
 /// first frame drawn.
 pub fn release_due() -> bool {
+    // SKUA_RELEASE_PAUSED=0 never releases (A/B tests).
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    let enabled = *ENABLED.get_or_init(|| {
+        std::env::var("SKUA_RELEASE_PAUSED").map_or(true, |v| v.trim() != "0")
+    });
     let at = PAUSED_AT_MS.load(Ordering::Relaxed);
-    at != 0
+    enabled
+        && at != 0
         && clock_ms().saturating_sub(at) >= 10_000
         && !PAUSE_RELEASED.swap(true, Ordering::Relaxed)
 }

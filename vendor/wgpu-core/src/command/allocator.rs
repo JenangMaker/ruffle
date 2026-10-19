@@ -31,6 +31,13 @@ const RECYCLE_EVERY: usize = 64;
 
 static RELEASES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 static RELEASE_ALL: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// VibeSkua: false keeps every free encoder, as wgpu does (A/B tests).
+static RECYCLING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+
+/// VibeSkua: turns the cap and the recycling above on (the default) or off.
+pub fn set_command_pool_recycling(on: bool) {
+    RECYCLING.store(on, core::sync::atomic::Ordering::Relaxed);
+}
 
 /// VibeSkua: destroy every free command pool (and the driver memory it
 /// keeps) the next time an encoder is acquired or released. For an idle or
@@ -77,7 +84,9 @@ impl CommandAllocator {
             free_encoders.clear();
         }
         let n = RELEASES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        if free_encoders.len() < MAX_FREE_ENCODERS && n % RECYCLE_EVERY != 0 {
+        if !RECYCLING.load(core::sync::atomic::Ordering::Relaxed)
+            || (free_encoders.len() < MAX_FREE_ENCODERS && n % RECYCLE_EVERY != 0)
+        {
             free_encoders.push(encoder);
         }
         // Otherwise the encoder is dropped here, which destroys its command

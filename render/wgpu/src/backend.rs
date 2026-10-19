@@ -218,6 +218,12 @@ impl WgpuRenderBackend<crate::target::TextureTarget> {
 
 impl<T: RenderTarget> WgpuRenderBackend<T> {
     pub fn new(descriptors: Arc<Descriptors>, target: T) -> Result<Self, Error> {
+        // VibeSkua: RUFFLE_POOL_RECYCLE=0 keeps every free command pool, as
+        // wgpu does (vendor/wgpu-core/PATCHED.md), for A/B tests.
+        #[cfg(not(target_family = "wasm"))]
+        wgpu_core::command::set_command_pool_recycling(
+            std::env::var("RUFFLE_POOL_RECYCLE").map_or(true, |v| v.trim() != "0"),
+        );
         if target.width() > descriptors.limits.max_texture_dimension_2d
             || target.height() > descriptors.limits.max_texture_dimension_2d
         {
