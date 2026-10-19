@@ -24,7 +24,7 @@ ruffle_render = { path = "../render", features = ["clap"] }
 ruffle_render_wgpu = { path = "../render/wgpu", features = ["clap"] }
 ruffle_video_software = { path = "../video/software", optional = true }
 ruffle_video_external = { path = "../video/external", features = ["openh264"], optional = true }
-ruffle_frontend_utils = { path = "../frontend-utils", features = ["cpal", "fs", "navigator"] }
+ruffle_frontend_utils = { path = "../frontend-utils", default-features = false, features = ["cpal", "fs", "navigator"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-appender = "0.2.5"
@@ -86,7 +86,13 @@ InternalName = "ruffle_desktop"
 OriginalFilename = "ruffle.exe"
 
 [features]
-default = ["software_video", "external_video", "lzma", "fontconfig", "freetype"]
+default = ["software_video", "external_video", "lzma", "fontconfig", "freetype", "native-tls"]
+# TLS for the player's downloads: the system's (OpenSSL on Linux, SChannel on
+# Windows), or rustls with its own root certificates. VibeSkua's Linux build
+# takes rustls: OpenSSL's library name changed (libssl.so.1.1 to .so.3), so a
+# player linked to one does not start on distributions that ship the other.
+native-tls = ["ruffle_frontend_utils/native-tls"]
+rustls-tls = ["ruffle_frontend_utils/rustls-tls"]
 jpegxr = ["ruffle_core/jpegxr"]
 
 # core features
