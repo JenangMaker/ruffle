@@ -29,6 +29,10 @@ indexmap = { workspace = true }
 smallvec = { workspace = true }
 wgpu-profiler = { workspace = true }
 
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+# The patched copy in vendor/: release_free_command_pools.
+wgpu-core = { version = "30.0.1", default-features = false }
+
 # desktop
 [target.'cfg(not(target_family = "wasm"))'.dependencies.futures]
 workspace = true

@@ -903,6 +903,18 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         // headless tab drew nothing.
         self.texture_pool = TexturePool::new();
         self.trim_offscreen_pool();
+        // And the driver's command pools, with all they kept of earlier
+        // frames: hundreds of MB (vendor/wgpu-core/PATCHED.md). The empty
+        // submission below makes wgpu-core apply it.
+        #[cfg(not(target_family = "wasm"))]
+        {
+            wgpu_core::command::release_free_command_pools();
+            let encoder = self
+                .descriptors
+                .device
+                .create_command_encoder(&Default::default());
+            self.descriptors.queue.submit([encoder.finish()]);
+        }
         // Let the GPU finish with them, so their memory is freed now.
         let _ = self.descriptors.device.poll(wgpu::PollType::Wait {
             submission_index: None,
