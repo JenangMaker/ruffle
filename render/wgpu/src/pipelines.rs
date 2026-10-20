@@ -21,6 +21,7 @@ pub const VERTEX_BUFFERS_DESCRIPTION_POS_UV: [Option<wgpu::VertexBufferLayout>; 
         attributes: &vertex_attr_array![
             0 => Float32x2,
             1 => Float32x3,
+            2 => Snorm16x4,
         ],
     })];
 
@@ -31,6 +32,7 @@ pub const VERTEX_BUFFERS_DESCRIPTION_COLOR: [Option<wgpu::VertexBufferLayout>; 1
         attributes: &vertex_attr_array![
             0 => Float32x2,
             1 => Float32x4,
+            2 => Snorm16x4,
         ],
     })];
 
@@ -88,8 +90,18 @@ impl Pipelines {
         shaders: &Shaders,
         format: wgpu::TextureFormat,
         msaa_sample_count: u32,
+        edge_aa: Option<(f32, f32)>,
         bind_layouts: &BindLayouts,
     ) -> Self {
+        // VibeSkua: the edge fringe's width and inner coverage for the shape
+        // fills (color, gradient, bitmap); unset, fringes draw nothing.
+        let edge_constants: Vec<(&str, f64)> = match edge_aa {
+            Some((width, inner)) => vec![
+                ("common__edge_width", f64::from(width)),
+                ("common__edge_inner", f64::from(inner)),
+            ],
+            None => Vec::new(),
+        };
         let colort_bindings = vec![Some(&bind_layouts.globals), Some(&bind_layouts.transforms)];
 
         let color_pipelines = create_shape_pipeline(
@@ -103,6 +115,7 @@ impl Pipelines {
             BlendState::PREMULTIPLIED_ALPHA_BLENDING,
             0,
             PrimitiveTopology::TriangleList,
+            &edge_constants,
         );
 
         let lines_pipelines = create_shape_pipeline(
@@ -116,6 +129,7 @@ impl Pipelines {
             BlendState::PREMULTIPLIED_ALPHA_BLENDING,
             0,
             PrimitiveTopology::LineStrip,
+            &edge_constants,
         );
 
         let gradient_bindings = vec![
@@ -135,6 +149,7 @@ impl Pipelines {
             BlendState::PREMULTIPLIED_ALPHA_BLENDING,
             0,
             PrimitiveTopology::TriangleList,
+            &edge_constants,
         );
 
         let complex_blend_bindings =
@@ -152,6 +167,7 @@ impl Pipelines {
                 BlendState::REPLACE,
                 0,
                 PrimitiveTopology::TriangleList,
+                &[],
             )
         };
 
@@ -173,6 +189,7 @@ impl Pipelines {
                 blend.blend_state(),
                 0,
                 PrimitiveTopology::TriangleList,
+                &edge_constants,
             )
         });
 
@@ -198,6 +215,7 @@ impl Pipelines {
             })],
             &VERTEX_BUFFERS_DESCRIPTION_POS_UV,
             msaa_sample_count,
+            &[],
             &[("late_saturate", 1.0)],
             PrimitiveTopology::TriangleList,
         ));
@@ -227,6 +245,7 @@ impl Pipelines {
             &VERTEX_BUFFERS_DESCRIPTION_POS_UV,
             msaa_sample_count,
             &[],
+            &[],
             PrimitiveTopology::TriangleList,
         ));
 
@@ -247,6 +266,7 @@ impl Pipelines {
             BlendState::PREMULTIPLIED_ALPHA_BLENDING,
             0,
             PrimitiveTopology::TriangleList,
+            &[],
         );
 
         Self {
@@ -272,6 +292,7 @@ fn create_pipeline_descriptor<'a>(
     color_target_state: &'a [Option<wgpu::ColorTargetState>],
     vertex_buffer_layout: &'a [Option<wgpu::VertexBufferLayout<'a>>],
     msaa_sample_count: u32,
+    vertex_constants: &'a [(&str, f64)],
     fragment_constants: &'a [(&str, f64)],
     primitive_topology: PrimitiveTopology,
 ) -> wgpu::RenderPipelineDescriptor<'a> {
@@ -282,7 +303,10 @@ fn create_pipeline_descriptor<'a>(
             module: vertex_shader,
             entry_point: Some("main_vertex"),
             buffers: vertex_buffer_layout,
-            compilation_options: Default::default(),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                constants: vertex_constants,
+                ..Default::default()
+            },
         },
         fragment: Some(wgpu::FragmentState {
             module: fragment_shader,
@@ -331,6 +355,7 @@ fn create_shape_pipeline(
     blend: BlendState,
     immediate_size: u32,
     primitive_topology: PrimitiveTopology,
+    edge_constants: &[(&str, f64)],
 ) -> ShapePipeline {
     let pipeline_layout_label = create_debug_label!("{} shape pipeline layout", name);
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -364,6 +389,8 @@ fn create_shape_pipeline(
             })],
             vertex_buffers_layout,
             msaa_sample_count,
+            // VibeSkua: no edge fringe in a mask's stencil (no color written).
+            if write_mask.is_empty() { &[] } else { edge_constants },
             &[],
             primitive_topology,
         ))
@@ -383,6 +410,7 @@ fn create_shape_pipeline(
             })],
             vertex_buffers_layout,
             msaa_sample_count,
+            edge_constants,
             &[],
             primitive_topology,
         )),

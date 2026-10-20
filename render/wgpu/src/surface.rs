@@ -130,12 +130,24 @@ impl Surface {
             depth_or_array_layers: 1,
         };
 
-        let sample_count = supported_sample_count(
-            &descriptors.adapter,
-            quality.sample_count(),
+        // VibeSkua: with edge smoothing (RUFFLE_EDGE_AA) shapes get edge
+        // fringes instead of multisampling, above Low quality (Flash's Low
+        // smoothed nothing).
+        let edge_aa = crate::backend::edge_aa().is_some();
+        let sample_count = if edge_aa {
+            1
+        } else {
+            supported_sample_count(
+                &descriptors.adapter,
+                quality.sample_count(),
+                frame_buffer_format,
+            )
+        };
+        let pipelines = descriptors.pipelines(
+            sample_count,
             frame_buffer_format,
+            edge_aa && quality != StageQuality::Low,
         );
-        let pipelines = descriptors.pipelines(sample_count, frame_buffer_format);
         Self {
             size,
             quality,

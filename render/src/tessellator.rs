@@ -18,9 +18,13 @@ pub struct ShapeTessellator {
     lyon_mesh: VertexBuffers<Vertex, u32>,
     mask_index_count: Option<u32>,
     is_stroke: bool,
+    edge_fringe: bool,
 }
 
 const TESSELLATION_EPSILON: f32 = 0.0000001;
+
+/// `Vertex::aa` of a vertex inside a fill or stroke (not part of a fringe).
+const AA_INTERIOR: [f32; 4] = [0.0, 0.0, 0.0, 0.0];
 
 impl ShapeTessellator {
     pub fn new() -> Self {
@@ -32,7 +36,15 @@ impl ShapeTessellator {
             lyon_mesh: VertexBuffers::new(),
             mask_index_count: None,
             is_stroke: false,
+            edge_fringe: false,
         }
+    }
+
+    /// VibeSkua: also make an edge fringe for every fill and stroke (see
+    /// `add_edge_fringe`), for a renderer that smooths edges with it instead
+    /// of multisampling.
+    pub fn set_edge_fringe(&mut self, on: bool) {
+        self.edge_fringe = on;
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -160,6 +172,7 @@ impl ShapeTessellator {
             }
             self.is_stroke = next_is_stroke;
 
+            let first_index = self.lyon_mesh.indices.len();
             let mut buffers_builder =
                 BuffersBuilder::new(&mut self.lyon_mesh, RuffleVertexCtor { color });
             let result = match path {
@@ -225,6 +238,9 @@ impl ShapeTessellator {
             };
             match result {
                 Ok(_) => {
+                    if self.edge_fringe {
+                        add_edge_fringe(&mut self.lyon_mesh, first_index, color);
+                    }
                     if needs_flush {
                         // Non-solid color fills are isolated draw calls; flush immediately.
                         self.flush_draw(draw);
@@ -318,6 +334,93 @@ pub struct Vertex {
     pub x: f32,
     pub y: f32,
     pub color: swf::Color,
+    /// VibeSkua: edge fringe data, all 0 outside a fringe. In a fringe: the
+    /// edge's outward unit normal (x, y, in shape space), 0 on the edge or 1
+    /// on the fringe's outer side, and 1 (a fringe vertex).
+    pub aa: [f32; 4],
+}
+
+/// VibeSkua: edge smoothing without multisampling. For each outline edge of
+/// the triangles from `first_index` on (one path's fill or stroke), adds a
+/// quad of two vertices on the edge and two more at the same places, marked
+/// to be pushed outward by the renderer (a fraction of a pixel on screen,
+/// whatever the scale). The renderer draws it fading from the edge to
+/// nothing, so a shape's edge pixels get partial coverage, as Flash Player's
+/// edges did, at the cost of a few triangles instead of drawing everything
+/// several times over.
+///
+/// An outline edge is one that belongs to a single triangle: that is right
+/// for any fill rule and for overlapping contours, and the triangle's third
+/// corner says which side is inside. Edges shared by two triangles are
+/// inside the shape and get nothing.
+fn add_edge_fringe(mesh: &mut VertexBuffers<Vertex, u32>, first_index: usize, color: swf::Color) {
+    use std::collections::HashMap;
+    use std::collections::hash_map::Entry;
+
+    // Vertices are compared by position, in case the tessellator made two at
+    // one place (an edge between them would otherwise look like an outline).
+    let key = |v: &Vertex| (v.x.to_bits(), v.y.to_bits());
+    let mut ids: HashMap<(u32, u32), u32> = HashMap::new();
+    let mut id_of = |index: u32, vertices: &[Vertex]| -> u32 {
+        let next = ids.len() as u32;
+        *ids.entry(key(&vertices[index as usize])).or_insert(next)
+    };
+
+    // Edge (lower id, higher id) -> (vertex a, vertex b, third vertex), or
+    // None once a second triangle has it.
+    let mut edges: HashMap<(u32, u32), Option<(u32, u32, u32)>> = HashMap::new();
+    let triangle_count = (mesh.indices.len() - first_index) / 3;
+    for t in 0..triangle_count {
+        let i = first_index + t * 3;
+        let tri = [mesh.indices[i], mesh.indices[i + 1], mesh.indices[i + 2]];
+        let id = tri.map(|index| id_of(index, &mesh.vertices));
+        if id[0] == id[1] || id[1] == id[2] || id[0] == id[2] {
+            continue;
+        }
+        for (a, b, c) in [(0, 1, 2), (1, 2, 0), (2, 0, 1)] {
+            let edge = (id[a].min(id[b]), id[a].max(id[b]));
+            match edges.entry(edge) {
+                Entry::Vacant(e) => {
+                    e.insert(Some((tri[a], tri[b], tri[c])));
+                }
+                Entry::Occupied(mut e) => {
+                    e.insert(None);
+                }
+            }
+        }
+    }
+
+    for (a, b, c) in edges.into_values().flatten() {
+        let pa = (mesh.vertices[a as usize].x, mesh.vertices[a as usize].y);
+        let pb = (mesh.vertices[b as usize].x, mesh.vertices[b as usize].y);
+        let pc = (mesh.vertices[c as usize].x, mesh.vertices[c as usize].y);
+        let (ex, ey) = (pb.0 - pa.0, pb.1 - pa.1);
+        let length = (ex * ex + ey * ey).sqrt();
+        if !(length > TESSELLATION_EPSILON) {
+            continue;
+        }
+        let (mut nx, mut ny) = (ey / length, -ex / length);
+        let inside = nx * (pc.0 - pa.0) + ny * (pc.1 - pa.1);
+        if inside.abs() <= TESSELLATION_EPSILON * length {
+            // A flat triangle: no inside to tell.
+            continue;
+        }
+        if inside > 0.0 {
+            nx = -nx;
+            ny = -ny;
+        }
+        let base = mesh.vertices.len() as u32;
+        for (side, p) in [(0.0, pa), (0.0, pb), (1.0, pa), (1.0, pb)] {
+            mesh.vertices.push(Vertex {
+                x: p.0,
+                y: p.1,
+                color,
+                aa: [nx, ny, side, 1.0],
+            });
+        }
+        mesh.indices
+            .extend_from_slice(&[base, base + 1, base + 2, base + 1, base + 3, base + 2]);
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -458,6 +561,7 @@ impl FillVertexConstructor<Vertex> for RuffleVertexCtor {
             x: vertex.position().x,
             y: vertex.position().y,
             color: self.color,
+            aa: AA_INTERIOR,
         }
     }
 }
@@ -468,6 +572,7 @@ impl StrokeVertexConstructor<Vertex> for RuffleVertexCtor {
             x: vertex.position().x,
             y: vertex.position().y,
             color: self.color,
+            aa: AA_INTERIOR,
         }
     }
 }

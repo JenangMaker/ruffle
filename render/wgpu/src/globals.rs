@@ -13,6 +13,9 @@ pub struct Globals {
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct GlobalsUniform {
     global_matrix: [[f32; 4]; 4],
+    /// VibeSkua: half the viewport's width and height in pixels (clip space
+    /// to pixels, for the edge fringe), then two unused.
+    viewport: [f32; 4],
 }
 
 impl Globals {
@@ -70,7 +73,10 @@ impl Globals {
         let temp_label = create_debug_label!("Globals buffer");
         let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: temp_label.as_deref(),
-            contents: bytemuck::cast_slice(&[GlobalsUniform { global_matrix }]),
+            contents: bytemuck::cast_slice(&[GlobalsUniform {
+                global_matrix,
+                viewport: [vw, vh, 0.0, 0.0],
+            }]),
             usage: wgpu::BufferUsages::UNIFORM,
         });
 

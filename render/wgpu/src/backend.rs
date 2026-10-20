@@ -273,7 +273,11 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             target,
             surface,
             meshes: Vec::new(),
-            shape_tessellator: ShapeTessellator::new(),
+            shape_tessellator: {
+                let mut tessellator = ShapeTessellator::new();
+                tessellator.set_edge_fringe(edge_aa().is_some());
+                tessellator
+            },
             viewport_scale_factor: 1.0,
             texture_pool: TexturePool::new(),
             offscreen_texture_pool: TexturePool::new(),
@@ -1442,6 +1446,34 @@ fn capped_quality(quality: StageQuality) -> StageQuality {
         Some(cap) if quality.sample_count() > cap.sample_count() => *cap,
         _ => quality,
     }
+}
+
+/// VibeSkua: RUFFLE_EDGE_AA=on smooths shape edges the way Flash Player did,
+/// with a soft border along each edge (an edge fringe, see the tessellator's
+/// `add_edge_fringe`), instead of drawing everything 2-4 times over
+/// (multisampling, which it then replaces). Fills keep hard edges inside, and
+/// the fringe adds the part of each edge pixel the shape covers outside them.
+/// Returns the fringe's width in pixels and its coverage at the edge: 0.5
+/// and 0.5 by default, a pixel's coverage by a straight edge; a number
+/// instead of `on` sets the width, RUFFLE_EDGE_AA_INNER the coverage. Off by
+/// default (Ruffle as usual).
+pub(crate) fn edge_aa() -> Option<(f32, f32)> {
+    static EDGE: std::sync::OnceLock<Option<(f32, f32)>> = std::sync::OnceLock::new();
+    *EDGE.get_or_init(|| {
+        let value = std::env::var("RUFFLE_EDGE_AA").ok()?;
+        let value = value.trim();
+        let width = if value.eq_ignore_ascii_case("on") || value == "1" || value.eq_ignore_ascii_case("true") {
+            0.5
+        } else {
+            value.parse::<f32>().ok().filter(|w| *w > 0.0 && *w <= 4.0)?
+        };
+        let inner = std::env::var("RUFFLE_EDGE_AA_INNER")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|v| (0.0..=1.0).contains(v))
+            .unwrap_or(0.5);
+        Some((width, inner))
+    })
 }
 
 /// VibeSkua: RUFFLE_FILTERS=off draws as Ruffle's browser WebGL renderer does,
