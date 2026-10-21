@@ -590,6 +590,28 @@ impl ApplicationHandler<RuffleEvent> for App {
                 }
             }
 
+            // VibeSkua: SKUA_PARENT_HWND (Windows) makes the window a child of
+            // VibeSkua's from the start, frameless, instead of a top-level
+            // window that VibeSkua moves into its own afterwards (SetParent).
+            // The graphics driver then sets up presenting for a child window,
+            // not for a top-level one that later stops being one.
+            #[cfg(windows)]
+            if let Some(hwnd) = std::env::var("SKUA_PARENT_HWND")
+                .ok()
+                .and_then(|v| v.trim().parse::<isize>().ok())
+                .and_then(std::num::NonZeroIsize::new)
+            {
+                use winit::raw_window_handle::{RawWindowHandle, Win32WindowHandle};
+                let parent = RawWindowHandle::Win32(Win32WindowHandle::new(hwnd));
+                // SAFETY: VibeSkua keeps that window open while this player
+                // runs; when it goes, Windows destroys this child with it and
+                // the player ends (the bridge's parent watch).
+                window_attributes = unsafe { window_attributes.with_parent_window(Some(parent)) }
+                    .with_decorations(false);
+                // Warn: the only level VibeSkua logs from here.
+                tracing::warn!("drawing inside window {hwnd} (SKUA_PARENT_HWND)");
+            }
+
             let event_loop_proxy = self.event_loop_proxy.clone();
             let preferences = self.preferences.clone();
             let window = event_loop
