@@ -1462,10 +1462,16 @@ pub(crate) fn edge_aa() -> Option<(f32, f32)> {
     *EDGE.get_or_init(|| {
         let value = std::env::var("RUFFLE_EDGE_AA").ok()?;
         let value = value.trim();
-        let width = if value.eq_ignore_ascii_case("on") || value == "1" || value.eq_ignore_ascii_case("true") {
+        let width = if value.eq_ignore_ascii_case("on")
+            || value == "1"
+            || value.eq_ignore_ascii_case("true")
+        {
             0.5
         } else {
-            value.parse::<f32>().ok().filter(|w| *w > 0.0 && *w <= 4.0)?
+            value
+                .parse::<f32>()
+                .ok()
+                .filter(|w| *w > 0.0 && *w <= 4.0)?
         };
         let inner = std::env::var("RUFFLE_EDGE_AA_INNER")
             .ok()

@@ -152,7 +152,11 @@ impl Descriptors {
                     &self.shaders,
                     format,
                     msaa_sample_count,
-                    if edge_aa { crate::backend::edge_aa() } else { None },
+                    if edge_aa {
+                        crate::backend::edge_aa()
+                    } else {
+                        None
+                    },
                     &self.bind_layouts,
                 ))
             })
