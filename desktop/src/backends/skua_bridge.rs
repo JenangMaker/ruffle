@@ -374,6 +374,18 @@ pub fn rendered(cost: Duration) {
                 use ruffle_core::skua_stats as g;
                 use std::sync::atomic::Ordering::Relaxed;
                 let secs = span.as_secs_f64();
+                // Game frames run in the same minute: more than the pictures
+                // drawn means a tick ran several frames before one picture.
+                let frames_run = {
+                    static LAST: AtomicU64 = AtomicU64::new(0);
+                    let now = g::FRAMES.load(Relaxed);
+                    now - LAST.swap(now, Relaxed)
+                };
+                tracing::warn!(
+                    "skua bridge: game frames run: {:.1} a second ({:.1} pictures drawn)",
+                    frames_run as f64 / secs,
+                    stats.frames as f64 / span.as_secs_f64(),
+                );
                 tracing::warn!(
                     "skua bridge: gotos a second: {:.0} no-op, {:.0} inner passes taking {:.0} ms a second; {} orphans",
                     g::NOOP_GOTOS.swap(0, Relaxed) as f64 / secs,
