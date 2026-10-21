@@ -685,11 +685,16 @@ fn run(
     let mut queued: VecDeque<String> = VecDeque::new();
     let mut backoff = Duration::from_secs(1);
     let mut next_try = Instant::now();
+    // Connecting, failing and losing the connection are logged as warnings:
+    // VibeSkua records only those from here, and a player that never reached
+    // Skua (GitHub issue #2: the game ran, Skua could not drive it) said
+    // nothing about why.
     let drop_socket = |socket: &mut Option<WebSocket<TcpStream>>, why: String| {
         if socket.take().is_some() {
-            tracing::info!("skua bridge disconnected ({why}); retrying");
+            tracing::warn!("skua bridge disconnected ({why}); retrying");
         }
     };
+    let mut failed_tries = 0u32;
     // Skua started this player; if Skua goes away without ending it (killed outright),
     // nothing drives the player any more: exit.
     let parent_alive = parent_watch();
@@ -734,7 +739,12 @@ fn run(
         if socket.is_none() && Instant::now() >= next_try {
             match connect(url) {
                 Ok(mut ws) => {
-                    tracing::info!("skua bridge connected: {url}");
+                    if failed_tries > 0 {
+                        tracing::warn!("skua bridge connected: {url}, after {failed_tries} failed tries");
+                    } else {
+                        tracing::warn!("skua bridge connected: {url}");
+                    }
+                    failed_tries = 0;
                     backoff = Duration::from_secs(1);
                     let mut ok = true;
                     while let Some(text) = queued.pop_front() {
@@ -750,7 +760,15 @@ fn run(
                     }
                 }
                 Err(e) => {
-                    tracing::debug!("skua bridge: {url} not reachable ({e}); retrying");
+                    // The first failure, then about one a minute (tries are
+                    // at most 15 s apart).
+                    if failed_tries % 4 == 0 {
+                        tracing::warn!(
+                            "skua bridge: {url} not reachable ({e}); retrying ({} failed so far)",
+                            failed_tries + 1
+                        );
+                    }
+                    failed_tries += 1;
                     next_try = Instant::now() + backoff;
                     backoff = (backoff * 2).min(Duration::from_secs(15));
                 }
@@ -843,7 +861,23 @@ fn connect(url: &str) -> Result<WebSocket<TcpStream>, String> {
     let stream =
         TcpStream::connect_timeout(&addr, Duration::from_secs(2)).map_err(|e| e.to_string())?;
     stream.set_nodelay(true).map_err(|e| e.to_string())?;
+    // The handshake reads a blocking socket: without a limit, a listener that
+    // took the connection and never answered (one stuck after a player
+    // crashed while connecting, or another program on the port) held this
+    // thread for good, and the player never reached Skua or said why.
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|e| e.to_string())?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .map_err(|e| e.to_string())?;
     let (ws, _) = tungstenite::client::client(url, stream).map_err(|e| e.to_string())?;
+    ws.get_ref()
+        .set_read_timeout(None)
+        .map_err(|e| e.to_string())?;
+    ws.get_ref()
+        .set_write_timeout(None)
+        .map_err(|e| e.to_string())?;
     ws.get_ref()
         .set_nonblocking(true)
         .map_err(|e| e.to_string())?;
