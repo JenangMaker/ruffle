@@ -611,12 +611,26 @@ impl CommandBounds {
 /// pass, right before the chunk that composites them from their places. The
 /// picture is the same: each group is drawn alone on transparent pixels, as on
 /// its own texture.
+///
+/// Complex blends (Overlay, Hard Light, Lighten, ...) read their parent, so
+/// they still composite one by one, but their groups are drawn on the page too
+/// and copied from it into textures of their own (copies are not passes; the
+/// blend shaders read the same pixels as before). The chunks that composite
+/// them wait (see `WgpuCommandHandler::held`) until the page is drawn.
 const ATLAS_SIZE: u32 = 2048;
+
+/// The most texture memory the waiting complex blends may hold before the page
+/// is drawn early (their textures stay out of the pool until then).
+const ATLAS_HELD_BYTES: u64 = 64 << 20;
 
 struct AtlasBatch {
     page: std::sync::Arc<PoolOrArcTexture>,
     binds: wgpu::BindGroup,
     commands: Vec<Command>,
+    /// Complex blend groups to copy out once the page is drawn: their place
+    /// (x, y, width, height) and their own texture.
+    copies: Vec<(u32, u32, u32, u32, wgpu::Texture)>,
+    copied_bytes: u64,
     // Rows: the next place in the current row, and the row's height.
     x: u32,
     y: u32,
@@ -662,6 +676,8 @@ impl AtlasBatch {
             page,
             binds,
             commands: Vec::new(),
+            copies: Vec::new(),
+            copied_bytes: 0,
             x: 0,
             y: 0,
             row_height: 0,
@@ -914,6 +930,9 @@ struct WgpuCommandHandler<'encoder, 'global: 'encoder> {
     opaque: bool,
     /// VibeSkua: blend groups waiting to be drawn together (see `AtlasBatch`).
     atlas: Option<AtlasBatch>,
+    /// VibeSkua: chunks made while the atlas page has groups not drawn yet:
+    /// they composite from it, so they run, in order, once it is drawn.
+    held: Vec<Chunk>,
 
     result: Vec<Chunk>,
     current: Vec<DrawCommand>,
@@ -961,6 +980,7 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
             sink,
             opaque: false,
             atlas: None,
+            held: Vec::new(),
 
             result: vec![],
             current: vec![],
@@ -979,7 +999,14 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
     /// made, a chunk gives its texture back for the next group to reuse; the
     /// GPU work is in the same order on the same encoder.
     fn push_chunk(&mut self, chunk: Chunk) {
-        self.flush_atlas();
+        if self.atlas.as_ref().is_some_and(|a| !a.commands.is_empty()) {
+            self.held.push(chunk);
+            return;
+        }
+        self.run_chunk(chunk);
+    }
+
+    fn run_chunk(&mut self, chunk: Chunk) {
         match &mut self.sink {
             Some(sink) => sink(
                 chunk,
@@ -991,8 +1018,9 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
         }
     }
 
-    /// Draws the waiting blend groups onto their atlas page, in one pass.
-    /// Called before the chunk that composites them from the page is drawn.
+    /// Draws the waiting blend groups onto their atlas page, in one pass,
+    /// copies the complex blends' groups out of it, then runs the chunks that
+    /// waited for it.
     fn flush_atlas(&mut self) {
         let Some(batch) = self.atlas.take() else {
             return;
@@ -1000,6 +1028,7 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
         if batch.commands.is_empty() {
             return;
         }
+        let copies = batch.copies;
         let mut list = CommandList::new();
         list.commands = batch.commands;
         let surface = Surface::new(
@@ -1021,6 +1050,30 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
             self.texture_pool,
         );
         target.ensure_cleared(self.draw_encoder);
+        for (x, y, width, height, texture) in copies {
+            self.draw_encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: batch.page.texture(),
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x, y, z: 0 },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+        for chunk in mem::take(&mut self.held) {
+            self.run_chunk(chunk);
+        }
     }
 
     fn new_transforms(
@@ -1255,6 +1308,77 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
                     blend_mode: trivial,
                 },
             );
+            return;
+        }
+        if let (Some(rect), BlendType::Complex(complex)) = (rect, &blend_type)
+            && rect.width <= ATLAS_SIZE
+            && rect.height <= ATLAS_SIZE
+            && !has_complex_blend(&commands.commands)
+        {
+            let complex = *complex;
+            let bytes = u64::from(rect.width) * u64::from(rect.height) * 4;
+            if self.atlas.as_ref().is_some_and(|a| {
+                a.place(rect.width, rect.height).is_none()
+                    || a.copied_bytes + bytes > ATLAS_HELD_BYTES
+            }) {
+                self.flush_atlas();
+            }
+            let atlas = self
+                .atlas
+                .get_or_insert_with(|| AtlasBatch::new(self.descriptors, self.texture_pool));
+            let (ax, ay) = atlas
+                .place(rect.width, rect.height)
+                .expect("a group fits an empty page");
+            atlas.take(rect.width, rect.height);
+            translate_commands(
+                &mut commands.commands,
+                Twips::from_pixels_i32(-(ax as i32)),
+                Twips::from_pixels_i32(-(ay as i32)),
+            );
+            atlas.commands.append(&mut commands.commands);
+            // The group's own texture, as the blend reads it (filled from the
+            // page by flush_atlas).
+            let texture = self.texture_pool.get_texture(
+                self.descriptors,
+                wgpu::Extent3d {
+                    width: rect.width,
+                    height: rect.height,
+                    depth_or_array_layers: 1,
+                },
+                wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::COPY_SRC
+                    | wgpu::TextureUsages::COPY_DST
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                wgpu::TextureFormat::Rgba8Unorm,
+                1,
+            );
+            let atlas = self.atlas.as_mut().expect("made above");
+            atlas
+                .copies
+                .push((ax, ay, rect.width, rect.height, texture.0.clone()));
+            atlas.copied_bytes += bytes;
+            if !self.current.is_empty() {
+                let chunk = Chunk::Draw {
+                    chunk: mem::take(&mut self.current),
+                    needs_stencil: self.needs_stencil,
+                    transforms: mem::replace(
+                        &mut self.transforms,
+                        Self::new_transforms(self.descriptors, self.dynamic_transforms),
+                    ),
+                    vertices: mem::replace(
+                        &mut self.vertices,
+                        Self::new_vertices(self.descriptors, self.dynamic_transforms),
+                    ),
+                };
+                self.push_chunk(chunk);
+            }
+            let chunk = Chunk::Blend {
+                texture: PoolOrArcTexture::Pool(texture),
+                blend_mode: ChunkBlendMode::Complex(complex),
+                needs_stencil: self.num_masks > 0,
+                rect: Some(rect),
+            };
+            self.push_chunk(chunk);
             return;
         }
         let clear_color = blend_type.default_color();
