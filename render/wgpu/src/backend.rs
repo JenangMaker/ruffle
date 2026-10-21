@@ -588,6 +588,9 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             return;
         };
 
+        // VibeSkua: the frame's commands go into several encoders, finished
+        // in parallel at submit (split_encoder.rs).
+        crate::split_encoder::begin();
         // VibeSkua: blurs and glows of cached bitmaps drawn together (filters/batch.rs).
         let mut batch = FilterBatch::default();
         for entry in cache_entries {
@@ -718,6 +721,10 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             // accumulate (e.g. when a large container's cacheAsBitmap is skipped
             // but its hundreds of children each have their own bitmap caches).
             self.active_frame.maybe_flush(&self.descriptors);
+            crate::split_encoder::cut(
+                &self.descriptors.device,
+                &mut self.active_frame.command_encoder,
+            );
         }
 
         batch.run(
@@ -747,6 +754,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         self.profiler
             .resolve_queries(&mut self.active_frame.command_encoder);
         self.active_frame.staging_belt.finish();
+        crate::split_encoder::end();
 
         let index = self
             .active_frame
@@ -1447,7 +1455,7 @@ impl ActiveFrame {
         let index = target.submit(
             &descriptors.device,
             &descriptors.queue,
-            Some(draw_encoder.finish()),
+            crate::split_encoder::finish_all(draw_encoder),
             frame,
         );
         self.staging_belt.recall();
@@ -1463,7 +1471,9 @@ impl ActiveFrame {
                 .device
                 .create_command_encoder(&Default::default()),
         );
-        let index = descriptors.queue.submit(Some(draw_encoder.finish()));
+        let index = descriptors
+            .queue
+            .submit(crate::split_encoder::finish_all(draw_encoder));
         self.staging_belt.recall();
         index
     }

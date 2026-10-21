@@ -266,6 +266,8 @@ impl Surface {
                     transforms,
                     vertices,
                 } => {
+                    // Between passes: the frame's encoder may be cut here.
+                    crate::split_encoder::cut(&descriptors.device, &mut **draw_encoder);
                     // Its pipeline must match this pass's stencil attachment.
                     if pending.first().is_some_and(|b| b.needs_stencil != needs_stencil) {
                         PendingBlend::draw_alone(

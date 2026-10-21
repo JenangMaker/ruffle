@@ -26,8 +26,12 @@ pub(crate) struct CommandAllocator {
 /// Destroying every pool halved the frame rate, so one release in
 /// RECYCLE_EVERY destroys its pool instead (a fresh one is made when needed),
 /// and release_free_command_pools() drops all of them at once.
-const MAX_FREE_ENCODERS: usize = 8;
-const RECYCLE_EVERY: usize = 64;
+/// A frame split over several encoders (ruffle's split_encoder.rs) uses a
+/// pool for each part and each part's barriers at submit, a few dozen a
+/// frame, each holding a share of the frame's commands: room for that many,
+/// recycled about as often as when a frame used two or three.
+const MAX_FREE_ENCODERS: usize = 48;
+const RECYCLE_EVERY: usize = 512;
 
 static RELEASES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 static RELEASE_ALL: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
