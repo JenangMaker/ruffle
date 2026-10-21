@@ -183,11 +183,6 @@ impl TextureStateSet {
         }
     }
 
-    fn clear(&mut self) {
-        self.simple.clear();
-        self.complex.clear();
-    }
-
     fn set_size(&mut self, size: usize) {
         self.simple.resize(size, TextureUses::UNINITIALIZED);
     }
@@ -284,8 +279,16 @@ impl TextureUsageScope {
         self.set.tracker_assert_in_bounds(index);
     }
 
+    // VibeSkua: as `BufferUsageScope::clear`: only the entries used go back to
+    // `UNINITIALIZED` (what `set_size` fills new ones with); the vector keeps
+    // its length instead of being refilled for every texture before each pass.
     pub fn clear(&mut self) {
-        self.set.clear();
+        for index in self.metadata.owned_indices() {
+            if let Some(state) = self.set.simple.get_mut(index) {
+                *state = TextureUses::UNINITIALIZED;
+            }
+        }
+        self.set.complex.clear();
         self.metadata.clear();
     }
 

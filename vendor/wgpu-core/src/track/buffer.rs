@@ -91,8 +91,17 @@ impl BufferUsageScope {
         strict_assert!(index < self.state.len());
         self.metadata.tracker_assert_in_bounds(index);
     }
+    // VibeSkua: only the entries this scope used go back to their fresh state;
+    // the vector keeps its length. It was emptied, and `set_size` then filled it
+    // again for every buffer alive, before every render pass: with many mesh
+    // buffers alive that was most of wgpu-core's cost per pass. The vector
+    // ends up exactly as before: unused entries are always `empty()`.
     pub fn clear(&mut self) {
-        self.state.clear();
+        for index in self.metadata.owned_indices() {
+            if let Some(state) = self.state.get_mut(index) {
+                *state = BufferUses::empty();
+            }
+        }
         self.metadata.clear();
     }
 
