@@ -22,6 +22,9 @@ pub struct Shaders {
     pub glow_filter: wgpu::ShaderModule,
     pub bevel_filter: wgpu::ShaderModule,
     pub displacement_map_filter: wgpu::ShaderModule,
+    /// VibeSkua: blurs and glows drawn side by side (filters/batch.rs).
+    pub blur_batch_filter: wgpu::ShaderModule,
+    pub glow_batch_filter: wgpu::ShaderModule,
 }
 
 impl Shaders {
@@ -70,6 +73,16 @@ impl Shaders {
             "filter/displacement_map.wgsl",
             include_str!("../shaders/filter/displacement_map.wgsl"),
         );
+        let blur_batch_filter = make_filter_shader(
+            device,
+            "filter/blur_batch.wgsl",
+            include_str!("../shaders/filter/blur_batch.wgsl"),
+        );
+        let glow_batch_filter = make_filter_shader(
+            device,
+            "filter/glow_batch.wgsl",
+            include_str!("../shaders/filter/glow_batch.wgsl"),
+        );
         let gradient_shader = make_shader(
             device,
             "gradient.wgsl",
@@ -107,6 +120,8 @@ impl Shaders {
             glow_filter,
             bevel_filter,
             displacement_map_filter,
+            blur_batch_filter,
+            glow_batch_filter,
         }
     }
 }

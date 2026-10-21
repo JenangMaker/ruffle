@@ -2,7 +2,7 @@ use crate::buffer_builder::BufferBuilder;
 use crate::buffer_pool::{BufferPool, TexturePool};
 use crate::context3d::WgpuContext3D;
 use crate::dynamic_transforms::DynamicTransforms;
-use crate::filters::FilterSource;
+use crate::filters::{FilterBatch, FilterSource};
 use crate::mesh::{CommonGradient, Mesh, PendingDraw};
 use crate::pixel_bender::{ShaderMode, run_pixelbender_shader_impl};
 use crate::surface::{LayerRef, Surface};
@@ -588,8 +588,19 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             return;
         };
 
+        // VibeSkua: blurs and glows of cached bitmaps drawn together (filters/batch.rs).
+        let mut batch = FilterBatch::default();
         for entry in cache_entries {
             let texture = as_texture(&entry.handle);
+            // Cached children come before their parents: a parent that draws a
+            // bitmap still waiting for its filters gets it finished first.
+            if batch.is_used_by(&entry.commands) {
+                batch.run(
+                    &self.descriptors,
+                    &mut self.active_frame.command_encoder,
+                    &mut self.offscreen_texture_pool,
+                );
+            }
             let surface = Surface::new(
                 &self.descriptors,
                 self.surface.quality(),
@@ -620,6 +631,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                     &mut self.offscreen_texture_pool,
                 );
             } else {
+                let batched = {
                 let mut scope = self
                     .profiler
                     .scope("Filters", &mut self.active_frame.command_encoder);
@@ -646,6 +658,11 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                     LayerRef::None,
                     &mut self.offscreen_texture_pool,
                 );
+                if FilterBatch::accepts(&entry.filters, &texture.texture)
+                    && *target.color_texture() == texture.texture
+                {
+                    Some(entry.filters)
+                } else {
                 for filter in entry.filters {
                     target = self.descriptors.filters.apply(
                         &self.descriptors,
@@ -683,6 +700,19 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                         &mut scope.scope("Copy filtered to CAB"),
                     );
                 }
+                None
+                }
+                };
+                if let Some(filters) = batched
+                    && let Err(filters) = batch.push(&texture.texture, filters)
+                {
+                    batch.run(
+                        &self.descriptors,
+                        &mut self.active_frame.command_encoder,
+                        &mut self.offscreen_texture_pool,
+                    );
+                    let _ = batch.push(&texture.texture, filters);
+                }
             }
             // Periodically flush GPU work to prevent OOM when many cache entries
             // accumulate (e.g. when a large container's cacheAsBitmap is skipped
@@ -690,6 +720,11 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             self.active_frame.maybe_flush(&self.descriptors);
         }
 
+        batch.run(
+            &self.descriptors,
+            &mut self.active_frame.command_encoder,
+            &mut self.offscreen_texture_pool,
+        );
         self.surface.draw_commands_and_copy_to(
             frame_output.view(),
             RenderTargetMode::FreshWithColor(wgpu::Color {

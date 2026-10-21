@@ -1,3 +1,4 @@
+mod batch;
 mod bevel;
 mod blur;
 mod color_matrix;
@@ -21,6 +22,7 @@ use crate::filters::shader::ShaderFilter;
 use crate::surface::target::CommandTarget;
 use bytemuck::{Pod, Zeroable};
 use ruffle_render::filters::Filter;
+pub use batch::FilterBatch;
 use wgpu::util::StagingBelt;
 use wgpu::vertex_attr_array;
 
@@ -192,6 +194,8 @@ pub struct Filters {
     pub glow: GlowFilter,
     pub bevel: BevelFilter,
     pub displacement_map: DisplacementMapFilter,
+    /// VibeSkua: see `batch.rs`.
+    pub batch: batch::BatchPipelines,
 }
 
 impl Filters {
@@ -203,6 +207,7 @@ impl Filters {
             glow: GlowFilter::new(device),
             bevel: BevelFilter::new(device),
             displacement_map: DisplacementMapFilter::new(device),
+            batch: batch::BatchPipelines::new(device),
         }
     }
 
