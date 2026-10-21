@@ -61,7 +61,7 @@ pub fn end() {
     ACTIVE.with(|active| active.set(false));
 }
 
-/// A point between passes of the frame's encoder: every `CUT_EVERY` of them
+/// A point between passes of the frame's encoder: every `cut_every()` of them
 /// the encoder is swapped for a fresh one.
 pub fn cut(device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder) {
     if !ACTIVE.with(Cell::get) {
