@@ -600,16 +600,29 @@ impl Player {
             return;
         }
 
-        // Every 5 s: drop the meshes of shapes not drawn for 20 s (made again
-        // when next drawn), see `Graphic::expire_meshes`.
+        // Every 5 s: drop the meshes of shapes not drawn for
+        // RUFFLE_MESH_IDLE_SECONDS (default 300; made again when next drawn),
+        // see `Graphic::expire_meshes`. It was 20 s: walking through a map,
+        // whatever had been off screen that long came back in one frame with
+        // every shape to tessellate again (frames of 60-140 ms, 28-156 shapes,
+        // measured in Yulgar). A tab that stops drawing still gives all of its
+        // meshes back after 10 s (`release_render_resources`).
         {
             use std::sync::atomic::{AtomicU64, Ordering};
             static LAST_SWEEP_MS: AtomicU64 = AtomicU64::new(0);
+            static IDLE_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+            let idle_ms = *IDLE_MS.get_or_init(|| {
+                std::env::var("RUFFLE_MESH_IDLE_SECONDS")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .unwrap_or(300)
+                    .saturating_mul(1000)
+            });
             let now = crate::display_object::mesh_clock_ms();
             if now.saturating_sub(LAST_SWEEP_MS.load(Ordering::Relaxed)) >= 5_000 {
                 LAST_SWEEP_MS.store(now, Ordering::Relaxed);
                 self.mutate_with_update_context(|context| {
-                    context.library.expire_idle_meshes(now, 20_000);
+                    context.library.expire_idle_meshes(now, idle_ms);
                 });
             }
         }
