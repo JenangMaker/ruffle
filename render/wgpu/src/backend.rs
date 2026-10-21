@@ -656,15 +656,33 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                         filter,
                     );
                 }
-                run_copy_pipeline(
-                    &self.descriptors,
-                    texture.texture.format(),
-                    &texture.texture.create_view(&Default::default()),
-                    target.color_view(),
-                    target.globals(),
-                    target.color_texture().sample_count(),
-                    &mut scope.scope("Copy filtered to CAB"),
-                );
+                // VibeSkua: the copy pipeline draws the filtered texture over
+                // the cached one pixel for pixel, so when both have the same
+                // size, format and a single sample, a texture copy is the same
+                // result without a render pass (one each per filtered object;
+                // passes are most of a frame's CPU cost on built-in graphics).
+                let filtered = target.color_texture();
+                if filtered.size() == texture.texture.size()
+                    && filtered.format() == texture.texture.format()
+                    && filtered.sample_count() == 1
+                    && texture.texture.sample_count() == 1
+                {
+                    scope.scope("Copy filtered to CAB").copy_texture_to_texture(
+                        filtered.as_image_copy(),
+                        texture.texture.as_image_copy(),
+                        texture.texture.size(),
+                    );
+                } else {
+                    run_copy_pipeline(
+                        &self.descriptors,
+                        texture.texture.format(),
+                        &texture.texture.create_view(&Default::default()),
+                        target.color_view(),
+                        target.globals(),
+                        target.color_texture().sample_count(),
+                        &mut scope.scope("Copy filtered to CAB"),
+                    );
+                }
             }
             // Periodically flush GPU work to prevent OOM when many cache entries
             // accumulate (e.g. when a large container's cacheAsBitmap is skipped
