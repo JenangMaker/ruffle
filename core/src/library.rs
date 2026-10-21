@@ -155,6 +155,10 @@ pub struct MovieLibrary<'gc> {
     /// Root clips of this movie as loaded by a `Loader` (held weakly). Having
     /// one makes the library collectable; see `add_root_anchor`.
     root_anchors: Vec<MovieClipWeak<'gc>>,
+
+    /// Whether a root clip was ever registered (`add_root_anchor`): the library
+    /// stays collectable after its dead anchors are forgotten.
+    anchored: bool,
 }
 
 impl<'gc> MovieLibrary<'gc> {
@@ -168,6 +172,7 @@ impl<'gc> MovieLibrary<'gc> {
             fonts: Default::default(),
             avm2_domain: None,
             root_anchors: Vec::new(),
+            anchored: false,
         }
     }
 
@@ -178,10 +183,11 @@ impl<'gc> MovieLibrary<'gc> {
     /// AVM1 movies, internal ones) are still kept for good.
     pub fn add_root_anchor(&mut self, root: MovieClip<'gc>) {
         self.root_anchors.push(root.downgrade());
+        self.anchored = true;
     }
 
     fn collectable(&self) -> bool {
-        !self.root_anchors.is_empty() && self.swf.is_action_script_3()
+        self.anchored && self.swf.is_action_script_3()
     }
 
     /// Whether anything that may still need this library is alive: its root
@@ -516,6 +522,10 @@ impl<'gc> Trace<'gc> for Resurrector<'_, 'gc> {
         }
     }
 
+    // A weak pointer can't be kept valid from here: the only weak pointers a
+    // library holds itself, its root anchors, are pruned of dead clips in
+    // `drop_unused_movie_libraries` instead. Those inside the objects resurrected
+    // are traced by the marking that resumes afterwards.
     fn trace_gc_weak(&mut self, _gc: GcWeak<'gc, ()>) {}
 }
 
@@ -673,6 +683,17 @@ impl<'gc> Library<'gc> {
         summary.dropped = unused.len();
         for movie in &unused {
             self.movie_libraries.0.remove(movie);
+        }
+        // The libraries kept forget their dead root clips now, while that can
+        // still be told: these weak pointers are not traced (the libraries are
+        // not, and `Resurrector` skips weak ones), so after the sweep a dead
+        // clip's memory is freed and checking it on the next collection read
+        // freed memory (a crash in `keep_reason`, in busy rooms where gear
+        // movies come and go; a library kept by a live class outlived its root).
+        for (_, library) in self.movie_libraries.0.iter_mut() {
+            if library.collectable() {
+                library.root_anchors.retain(|root| !root.is_dead(fc));
+            }
         }
         self.avm2_class_registry.prune_dead_classes(fc);
         self.last_gc_summary = summary;
