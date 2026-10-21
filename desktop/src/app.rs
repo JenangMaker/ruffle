@@ -32,6 +32,10 @@ struct MainWindow {
     /// (and on X11 only without a compositor). Always false elsewhere.
     occluded: bool,
     mouse_pos: PhysicalPosition<f64>,
+    /// VibeSkua: a mouse move not given to the player yet, and when the last
+    /// one was (see `mouse_move_interval`).
+    pending_mouse_move: Option<(f64, f64)>,
+    mouse_move_sent: Instant,
     modifiers: Modifiers,
     min_window_size: LogicalSize<u32>,
     max_window_size: PhysicalSize<u32>,
@@ -66,6 +70,17 @@ impl MainWindow {
                 ),
                 other => eprintln!("[ruffle-input] {now} {other:?}"),
             }
+        }
+        // VibeSkua: a waiting mouse move goes first, so the movie sees the
+        // pointer where it is when a button, wheel, key or leaving comes.
+        if matches!(
+            event,
+            WindowEvent::MouseInput { .. }
+                | WindowEvent::MouseWheel { .. }
+                | WindowEvent::CursorLeft { .. }
+                | WindowEvent::KeyboardInput { .. }
+        ) {
+            self.send_mouse_move();
         }
         if matches!(event, WindowEvent::RedrawRequested) {
             // Don't render when nobody can see the result: while minimized, the
@@ -147,10 +162,10 @@ impl MainWindow {
                 }
 
                 self.mouse_pos = position;
-                let (x, y) = self.gui.window_to_movie_position(position);
-                let event = PlayerEvent::MouseMove { x, y };
-                self.player.handle_event(event);
-                self.check_redraw();
+                self.pending_mouse_move = Some(self.gui.window_to_movie_position(position));
+                if self.mouse_move_sent.elapsed() >= mouse_move_interval() {
+                    self.send_mouse_move();
+                }
             }
             WindowEvent::DroppedFile(file) => {
                 if let Some(content_descriptor) = ContentDescriptor::new_local(&file, None) {
@@ -399,7 +414,25 @@ impl MainWindow {
         }
     }
 
+    /// VibeSkua: gives the player the waiting mouse move, if any.
+    fn send_mouse_move(&mut self) {
+        if let Some((x, y)) = self.pending_mouse_move.take() {
+            self.mouse_move_sent = Instant::now();
+            self.player.handle_event(PlayerEvent::MouseMove { x, y });
+            self.check_redraw();
+        }
+    }
+
+    /// VibeSkua: when the waiting mouse move is due, if there is one.
+    fn mouse_move_due(&self) -> Option<Instant> {
+        self.pending_mouse_move
+            .map(|_| self.mouse_move_sent + mouse_move_interval())
+    }
+
     fn about_to_wait(&mut self, gilrs: Option<&mut Gilrs>) {
+        if self.mouse_move_due().is_some_and(|due| Instant::now() >= due) {
+            self.send_mouse_move();
+        }
         if let Some(Event { event, .. }) = gilrs.and_then(|gilrs| gilrs.next_event()) {
             match event {
                 EventType::ButtonPressed(button, _) => {
@@ -621,6 +654,8 @@ impl ApplicationHandler<RuffleEvent> for App {
                 minimized: false,
                 occluded: false,
                 mouse_pos: PhysicalPosition::new(0.0, 0.0),
+                pending_mouse_move: None,
+                mouse_move_sent: Instant::now(),
                 modifiers: Modifiers::default(),
                 time: Instant::now(),
                 next_frame_time: None,
@@ -769,8 +804,13 @@ impl ApplicationHandler<RuffleEvent> for App {
             // only place where we're setting control flow, and events cancel wait.
             // Note: the control flow might be set to `ControlFlow::WaitUntil` with a
             // timestamp in the past! Take that into consideration when changing this code.
-            if let Some(next_frame_time) = main_window.next_frame_time {
-                event_loop.set_control_flow(ControlFlow::WaitUntil(next_frame_time));
+            // VibeSkua: or sooner, for a waiting mouse move.
+            let wake = match (main_window.next_frame_time, main_window.mouse_move_due()) {
+                (Some(frame), Some(mouse)) => Some(frame.min(mouse)),
+                (frame, mouse) => frame.or(mouse),
+            };
+            if let Some(wake) = wake {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(wake));
             }
         }
     }
@@ -795,4 +835,24 @@ enum LoadingState {
     Loading,
     WaitingForResize,
     Loaded,
+}
+
+/// VibeSkua: mouse moves reach the player at most once every
+/// `RUFFLE_MOUSE_MOVE_MS` (default 16, about 60 a second; 0: each one, as
+/// upstream). Each move checks what is under the pointer across the whole
+/// display tree, and a mouse reports 125-1000 moves a second: in a crowded
+/// room on a slow CPU that left the game stuttering while the mouse moved.
+/// Browsers send mouse moves once per animation frame too. The last move is
+/// never lost: it waits (the event loop wakes for it), and goes first when a
+/// button, wheel, key or leaving comes.
+fn mouse_move_interval() -> std::time::Duration {
+    static INTERVAL: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *INTERVAL.get_or_init(|| {
+        std::time::Duration::from_millis(
+            std::env::var("RUFFLE_MOUSE_MOVE_MS")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(16),
+        )
+    })
 }
