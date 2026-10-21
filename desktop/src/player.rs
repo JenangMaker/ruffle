@@ -344,6 +344,9 @@ impl ActivePlayer {
                     .and_then(|v| v.trim().parse().ok())
                     .unwrap_or(100),
             ))
+            // VibeSkua: a tab that is behind catches up one frame at most, and
+            // only when there is time for it (`RUFFLE_CATCH_UP=off`: up to five).
+            .with_catch_up_cap(std::env::var("RUFFLE_CATCH_UP").as_deref() != Ok("off"))
             .with_avm2_optimizer_enabled(opt.avm2_optimizer_enabled);
         let player = builder.build();
 

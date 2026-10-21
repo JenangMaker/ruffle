@@ -87,6 +87,24 @@ static LAST_RENDER: Mutex<Option<Instant>> = Mutex::new(None);
 static GAME_FPS_CENTI: AtomicU32 = AtomicU32::new(0);
 /// How long the last frame took to draw, in microseconds (see rendered()).
 static RENDER_COST_US: AtomicU64 = AtomicU64::new(0);
+/// Drawing's share of the main thread (see may_render): when it was last
+/// topped up, and the drawing time left, in ms (spent by rendered()).
+static DRAW_CREDIT: Mutex<(Option<Instant>, f64)> = Mutex::new((None, 0.0));
+/// At most this much drawing time is saved up, in ms (a few frames' worth).
+const DRAW_CREDIT_MAX_MS: f64 = 100.0;
+
+/// RUFFLE_DRAW_SHARE (0.2-0.9, default 0.6): the share of the main thread
+/// drawing may use on average.
+fn draw_share() -> f64 {
+    static SHARE: OnceLock<f64> = OnceLock::new();
+    *SHARE.get_or_init(|| {
+        std::env::var("RUFFLE_DRAW_SHARE")
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|v| (0.2..=0.9).contains(v))
+            .unwrap_or(0.6)
+    })
+}
 
 /// The player window's X11 id (on Windows its HWND), for Skua to embed it
 /// (page.windowId), as main.js's /game-window gave the Electron window's.
@@ -154,8 +172,14 @@ pub fn set_game_frame_rate(fps: f64) {
 /// - at most one picture per game frame, as Flash draws (and the original
 ///   VibeSkua: 24 a second, 30 with a script running), or the setRender cap if
 ///   lower; more pictures than game frames only repeat themselves;
-/// - drawing gets at most half of the main thread: after a frame that took D,
-///   the next starts no sooner than 2*D after it.
+/// - drawing gets at most RUFFLE_DRAW_SHARE (60%) of the main thread, on
+///   average: each millisecond adds that share to a drawing allowance (up to
+///   DRAW_CREDIT_MAX_MS), each frame drawn spends its time, and none is drawn
+///   while it is spent. This was "the next frame no sooner than twice the last
+///   one's time after it": checked frame by frame, any frame a little slower
+///   than usual (17 ms at the game's 30 frames a second) made the next game
+///   frame too early and skipped its picture, so a crowded room showed 19.5
+///   pictures of 28.9 game frames, unevenly.
 /// A frame may start a little early (3/4 of the frame time), as the game's
 /// frames do not come exactly on time and a strict wait would skip every other.
 pub fn may_render() -> bool {
@@ -176,11 +200,20 @@ pub fn may_render() -> bool {
         fps = fps.min(cap as f64);
     }
     let frame = Duration::from_secs_f64(0.75 / fps.max(1.0));
-    let busy = Duration::from_micros(RENDER_COST_US.load(Ordering::Relaxed) * 2);
     if let Some(previous) = *last
-        && now.duration_since(previous) < frame.max(busy)
+        && now.duration_since(previous) < frame
     {
         return false;
+    }
+    if let Ok(mut credit) = DRAW_CREDIT.lock() {
+        if let Some(topped) = credit.0 {
+            let gained = now.duration_since(topped).as_secs_f64() * 1000.0 * draw_share();
+            credit.1 = (credit.1 + gained).min(DRAW_CREDIT_MAX_MS);
+        }
+        credit.0 = Some(now);
+        if credit.1 < 0.0 {
+            return false;
+        }
     }
     *last = Some(now);
     true
@@ -343,6 +376,11 @@ fn thread_cpu_summary(span: Duration) -> String {
 pub fn rendered(cost: Duration) {
     note_time("draw", cost);
     RENDER_COST_US.store(cost.as_micros() as u64, Ordering::Relaxed);
+    // One very slow frame (a map loading) must not pause drawing for long:
+    // the allowance goes no lower than its maximum below zero.
+    if let Ok(mut credit) = DRAW_CREDIT.lock() {
+        credit.1 = (credit.1 - cost.as_secs_f64() * 1000.0).max(-DRAW_CREDIT_MAX_MS);
+    }
     if let Ok(mut guard) = DRAW_STATS.lock() {
         let stats = guard.get_or_insert_with(DrawStats::new);
         let us = cost.as_micros() as u64;
@@ -374,6 +412,18 @@ pub fn rendered(cost: Duration) {
                 use ruffle_core::skua_stats as g;
                 use std::sync::atomic::Ordering::Relaxed;
                 let secs = span.as_secs_f64();
+                // Game frames run in the same minute: more than the pictures
+                // drawn means a tick ran several frames before one picture.
+                let frames_run = {
+                    static LAST: AtomicU64 = AtomicU64::new(0);
+                    let now = g::FRAMES.load(Relaxed);
+                    now - LAST.swap(now, Relaxed)
+                };
+                tracing::warn!(
+                    "skua bridge: game frames run: {:.1} a second ({:.1} pictures drawn)",
+                    frames_run as f64 / secs,
+                    stats.frames as f64 / span.as_secs_f64(),
+                );
                 tracing::warn!(
                     "skua bridge: gotos a second: {:.0} no-op, {:.0} inner passes taking {:.0} ms a second; {} orphans",
                     g::NOOP_GOTOS.swap(0, Relaxed) as f64 / secs,

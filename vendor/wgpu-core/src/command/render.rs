@@ -2720,6 +2720,45 @@ pub(super) fn encode_render_pass(
     let encoder = &mut parent_state.raw_encoder;
     let tracker = &mut parent_state.tracker;
 
+    // VibeSkua: a command buffer (the "Pre Pass") was opened before every render
+    // pass for what has to happen first: barriers, clearing discarded surfaces,
+    // query resets, indirect draw validation. Ruffle records hundreds of passes a
+    // frame in a crowded AQW room, most with none of these, and each command
+    // buffer costs a begin and an end in the driver. With no fix-ups or query
+    // resets, the barriers are worked out first, and the command buffer is only
+    // opened when there is something to put in it. The GPU gets the same
+    // commands in the same order.
+    let no_validation = device.indirect_validation.is_none() || indirect_draw_validation_batcher.is_empty();
+    if pending_discard_init_fixups.is_empty() && pending_query_resets.is_empty() && no_validation {
+        tracker.buffers.set_from_usage_scope(&scope.buffers);
+        tracker.textures.set_from_usage_scope(&scope.textures);
+        let buffer_barriers = tracker
+            .buffers
+            .drain_transitions(parent_state.snatch_guard)
+            .collect::<Vec<_>>();
+        let (transitions, textures) = tracker.textures.drain_transitions(parent_state.snatch_guard);
+        let texture_barriers = transitions
+            .into_iter()
+            .enumerate()
+            .map(|(i, p)| p.into_hal(textures[i].unwrap().raw()))
+            .collect::<Vec<_>>();
+        if buffer_barriers.is_empty() && texture_barriers.is_empty() {
+            return Ok(());
+        }
+        let transit = encoder
+            .open_pass(hal_label(
+                Some("(wgpu internal) Pre Pass"),
+                device.instance_flags,
+            ))
+            .map_pass_err(pass_scope)?;
+        unsafe {
+            transit.transition_buffers(&buffer_barriers);
+            transit.transition_textures(&texture_barriers);
+        }
+        encoder.close_and_swap().map_pass_err(pass_scope)?;
+        return Ok(());
+    }
+
     {
         let transit = encoder
             .open_pass(hal_label(

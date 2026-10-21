@@ -982,6 +982,11 @@ impl DrawBatcher {
         }
     }
 
+    /// VibeSkua: whether no indirect draw was added (nothing to validate).
+    pub(crate) fn is_empty(&self) -> bool {
+        self.batches.is_empty()
+    }
+
     /// Add an indirect draw to be validated.
     ///
     /// Returns the index of the indirect buffer in `indirect_draw_validation_resources`
