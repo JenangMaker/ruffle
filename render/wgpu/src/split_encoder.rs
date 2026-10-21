@@ -23,8 +23,18 @@ use std::sync::OnceLock;
 
 /// Cut points between cuts: a few dozen passes per encoder, enough to keep the
 /// cost of each extra encoder small and few enough that a heavy frame spreads
-/// over the cores.
-const CUT_EVERY: u32 = 16;
+/// over the cores. `RUFFLE_SPLIT_EVERY` sets another count (1 cuts at every
+/// point, as the image tests are run to check the split).
+fn cut_every() -> u32 {
+    static EVERY: OnceLock<u32> = OnceLock::new();
+    *EVERY.get_or_init(|| {
+        std::env::var("RUFFLE_SPLIT_EVERY")
+            .ok()
+            .and_then(|n| n.parse().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(16)
+    })
+}
 
 thread_local! {
     static ACTIVE: Cell<bool> = const { Cell::new(false) };
@@ -62,7 +72,7 @@ pub fn cut(device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder) {
         since.set(n);
         n
     });
-    if since < CUT_EVERY {
+    if since < cut_every() {
         return;
     }
     SINCE_CUT.with(|since| since.set(0));
