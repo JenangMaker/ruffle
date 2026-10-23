@@ -787,6 +787,23 @@ fn blend_rect(commands: &CommandList, width: u32, height: u32) -> Option<BlendRe
     Some(rect)
 }
 
+/// Whether all that `commands` draw (and its anti-aliasing margin) lies inside
+/// `rect`: false when part of it is off the target, or its size is not known.
+fn drawn_within(commands: &CommandList, rect: BlendRect) -> bool {
+    let mut bounds = CommandBounds::new();
+    if !bounds.add(&commands.commands)
+        || bounds.min.0 > bounds.max.0
+        || bounds.min.1 > bounds.max.1
+    {
+        return false;
+    }
+    const MARGIN: f32 = 2.0;
+    bounds.min.0 - MARGIN >= rect.x as f32
+        && bounds.min.1 - MARGIN >= rect.y as f32
+        && bounds.max.0 + MARGIN <= (rect.x + rect.width) as f32
+        && bounds.max.1 + MARGIN <= (rect.y + rect.height) as f32
+}
+
 #[derive(Debug)]
 pub enum ChunkBlendMode {
     Complex(ComplexBlend),
@@ -1224,6 +1241,12 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
             }
             BlendType::Shader(_) => None,
         };
+        // VibeSkua: only a group drawn wholly inside its rect goes on an atlas
+        // page. The rect is clipped to the target (and its own texture clips
+        // the rest away), but on a page what is drawn past it lands on the
+        // other groups' places: Yulgar's room-sized Overlay lights, partly
+        // off screen, showed as light and dark boxes in other blends.
+        let on_page = rect.is_some_and(|rect| drawn_within(&commands, rect));
         let mut commands = commands;
         if let Some(rect) = rect {
             if rect.width == 0 {
@@ -1256,6 +1279,7 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
         };
         if let (Some(rect), BlendType::Trivial(trivial)) = (rect, &blend_type)
             && !matches!(trivial, TrivialBlend::Normal)
+            && on_page
             && rect.width <= ATLAS_SIZE
             && rect.height <= ATLAS_SIZE
             && !has_complex_blend(&commands.commands)
@@ -1311,6 +1335,7 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
             return;
         }
         if let (Some(rect), BlendType::Complex(complex)) = (rect, &blend_type)
+            && on_page
             && rect.width <= ATLAS_SIZE
             && rect.height <= ATLAS_SIZE
             && !has_complex_blend(&commands.commands)
