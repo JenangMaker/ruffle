@@ -72,6 +72,8 @@ pub enum TrivialBlend {
     Add,
     Subtract,
     Screen,
+    /// VibeSkua: Multiply onto an opaque target only (see below).
+    Multiply,
 }
 
 impl TrivialBlend {
@@ -91,6 +93,19 @@ impl TrivialBlend {
                 color: wgpu::BlendComponent {
                     src_factor: wgpu::BlendFactor::One,
                     dst_factor: wgpu::BlendFactor::OneMinusSrc,
+                    operation: wgpu::BlendOperation::Add,
+                },
+                alpha: wgpu::BlendComponent::OVER,
+            },
+            // Flash's Multiply (see shaders/blend/multiply.wgsl), on a target
+            // that is opaque where it draws: with dst.a = 1 it is
+            // src * dst + dst * (1 - src.a), a plain hardware blend, and the
+            // alpha stays 1. Its special case for a transparent dst does not
+            // arise there. No copy of the target and no break in its pass.
+            TrivialBlend::Multiply => wgpu::BlendState {
+                color: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::Dst,
+                    dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
                     operation: wgpu::BlendOperation::Add,
                 },
                 alpha: wgpu::BlendComponent::OVER,

@@ -27,8 +27,14 @@ use serde_json::{Map, Value as Json, json};
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+#[cfg(windows)]
+use std::net::TcpStream as WakeStream;
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
-use std::os::unix::net::UnixStream;
+#[cfg(unix)]
+use std::os::unix::net::UnixStream as WakeStream;
+#[cfg(windows)]
+use std::os::windows::io::AsRawSocket;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant};
@@ -43,6 +49,37 @@ const LOAD_CLIENT: &str = r#"{"id":-1,"fn":"loadClient","args":[]}"#;
 /// Drawing control (the page's maxRenderFps): paused draws nothing; the cap
 /// is frames drawn per second, 0 for no cap. The game runs either way.
 static DRAWING_PAUSED: AtomicBool = AtomicBool::new(false);
+/// When drawing was paused (`Instant` of the process start + ms), 0 while
+/// drawing; and whether that pause's resources were released (release_due).
+static PAUSED_AT_MS: AtomicU64 = AtomicU64::new(0);
+static PAUSE_RELEASED: AtomicBool = AtomicBool::new(false);
+
+fn clock_ms() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64 + 1
+}
+
+fn set_paused(paused: bool) {
+    let was = DRAWING_PAUSED.swap(paused, Ordering::Relaxed);
+    if paused && !was {
+        PAUSED_AT_MS.store(clock_ms(), Ordering::Relaxed);
+        PAUSE_RELEASED.store(false, Ordering::Relaxed);
+    } else if !paused {
+        PAUSED_AT_MS.store(0, Ordering::Relaxed);
+    }
+}
+
+/// True once per pause, when drawing has been paused (a hidden or headless
+/// tab) for 10 s: then the player hands back what only drawing needs
+/// (`Player::release_render_resources`). Not at once: switching between tabs
+/// pauses and resumes them, and everything released is made again on the
+/// first frame drawn.
+pub fn release_due() -> bool {
+    let at = PAUSED_AT_MS.load(Ordering::Relaxed);
+    at != 0
+        && clock_ms().saturating_sub(at) >= 10_000
+        && !PAUSE_RELEASED.swap(true, Ordering::Relaxed)
+}
 static RENDER_CAP_FPS: AtomicU32 = AtomicU32::new(0);
 static LAST_RENDER: Mutex<Option<Instant>> = Mutex::new(None);
 /// The game's current frame rate (stage.frameRate) in hundredths of a frame a
@@ -51,8 +88,8 @@ static GAME_FPS_CENTI: AtomicU32 = AtomicU32::new(0);
 /// How long the last frame took to draw, in microseconds (see rendered()).
 static RENDER_COST_US: AtomicU64 = AtomicU64::new(0);
 
-/// The player window's X11 id, for Skua to embed it (page.windowId), as
-/// main.js's /game-window gave the Electron window's.
+/// The player window's X11 id (on Windows its HWND), for Skua to embed it
+/// (page.windowId), as main.js's /game-window gave the Electron window's.
 static WINDOW_ID: OnceLock<u64> = OnceLock::new();
 
 pub fn set_window(window: &winit::window::Window) {
@@ -60,13 +97,37 @@ pub fn set_window(window: &winit::window::Window) {
     let id = match window.window_handle().map(|h| h.as_raw()) {
         Ok(RawWindowHandle::Xlib(h)) => Some(h.window as u64),
         Ok(RawWindowHandle::Xcb(h)) => Some(h.window.get() as u64),
+        Ok(RawWindowHandle::Win32(h)) => Some(h.hwnd.get() as u64),
         _ => None,
     };
     match id {
         Some(id) => {
             let _ = WINDOW_ID.set(id);
         }
-        None => tracing::warn!("skua bridge: not an X11 window; Skua cannot embed it"),
+        None => tracing::warn!("skua bridge: not an X11 or Win32 window; Skua cannot embed it"),
+    }
+}
+
+/// Windows: gives the keyboard to the player window when it is embedded (a
+/// child of Skua's window, in another process). A click there activates the
+/// top-level window, which keeps the focus: nothing moves it to the child, so
+/// the game got no keys. Parenting joined the two processes' input, so the
+/// child may take the focus itself; called on each mouse press.
+#[cfg(windows)]
+pub fn take_focus_if_embedded(window: &winit::window::Window) {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GWL_STYLE, GetWindowLongPtrW, WS_CHILD};
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let Ok(RawWindowHandle::Win32(handle)) = window.window_handle().map(|h| h.as_raw()) else {
+        return;
+    };
+    let hwnd = handle.hwnd.get() as windows_sys::Win32::Foundation::HWND;
+    // SAFETY: plain Win32 calls on our own window's handle.
+    unsafe {
+        let child = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32 & WS_CHILD != 0;
+        if child && GetFocus() != hwnd {
+            SetFocus(hwnd);
+        }
     }
 }
 
@@ -174,6 +235,7 @@ impl DrawStats {
 }
 
 /// CPU time used by the calling thread so far.
+#[cfg(unix)]
 pub fn thread_cpu_time() -> Duration {
     let mut ts = libc::timespec {
         tv_sec: 0,
@@ -182,6 +244,23 @@ pub fn thread_cpu_time() -> Duration {
     // SAFETY: clock_gettime only writes the timespec it is given.
     unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
     Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
+}
+
+/// CPU time used by the calling thread so far.
+#[cfg(windows)]
+pub fn thread_cpu_time() -> Duration {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
+    let zero = || FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let (mut created, mut exited, mut kernel, mut user) = (zero(), zero(), zero(), zero());
+    // SAFETY: GetThreadTimes only writes the four FILETIMEs it is given.
+    unsafe { GetThreadTimes(GetCurrentThread(), &mut created, &mut exited, &mut kernel, &mut user) };
+    let ticks = |t: FILETIME| ((t.dwHighDateTime as u64) << 32) | t.dwLowDateTime as u64;
+    // In 100 ns units.
+    Duration::from_nanos((ticks(kernel) + ticks(user)) * 100)
 }
 
 /// Adds the CPU time the main thread spent presenting a frame: compared with
@@ -196,9 +275,13 @@ pub fn note_present_cpu(took: Duration) {
 static THREAD_TICKS: Mutex<Option<std::collections::HashMap<u32, u64>>> = Mutex::new(None);
 
 /// The player's threads' CPU use since the last call, summed by thread name,
-/// busiest first, as "name 12%" (of one core over `span`).
+/// busiest first, as "name 12%" (of one core over `span`). Linux only (from
+/// /proc); elsewhere empty.
 fn thread_cpu_summary(span: Duration) -> String {
+    #[cfg(unix)]
     let hz = (unsafe { libc::sysconf(libc::_SC_CLK_TCK) }).max(1) as f64;
+    #[cfg(not(unix))]
+    let hz = 100.0;
     let mut now = std::collections::HashMap::new();
     let mut by_name: Vec<(String, u64)> = Vec::new();
     let Ok(mut guard) = THREAD_TICKS.lock() else {
@@ -365,7 +448,98 @@ fn profile(f: impl FnOnce(&mut Profile)) {
 /// bridge thread when one is queued. The thread sleeps in poll() on the socket
 /// and this pipe: a timed read instead held each reply for up to a kernel
 /// timer tick (7 ms measured), most of a call's time.
-static OUTGOING: OnceLock<(mpsc::Sender<String>, UnixStream)> = OnceLock::new();
+static OUTGOING: OnceLock<(mpsc::Sender<String>, WakeStream)> = OnceLock::new();
+
+/// The wake-up pipe: a socket pair on Unix. Windows has no socket pairs, and
+/// WSAPoll waits only on sockets, so there two loopback TCP sockets.
+#[cfg(unix)]
+fn wake_pair() -> std::io::Result<(WakeStream, WakeStream)> {
+    WakeStream::pair()
+}
+
+#[cfg(windows)]
+fn wake_pair() -> std::io::Result<(WakeStream, WakeStream)> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let a = TcpStream::connect(listener.local_addr()?)?;
+    let (b, from) = listener.accept()?;
+    // Some other local program could have connected first.
+    if from != a.local_addr()? {
+        return Err(std::io::Error::other("unexpected connection to the wake-up socket"));
+    }
+    a.set_nodelay(true)?;
+    Ok((a, b))
+}
+
+/// Whether the Skua that started this player is still there. On Unix the
+/// player is re-parented when its parent dies; Windows does not track parents,
+/// so there Skua passes its process id (SKUA_PARENT_PID) and this checks that
+/// process (without it, always true).
+#[cfg(unix)]
+fn parent_watch() -> impl Fn() -> bool {
+    // SAFETY: getppid has no preconditions.
+    let parent = unsafe { libc::getppid() };
+    move || (unsafe { libc::getppid() }) == parent
+}
+
+#[cfg(windows)]
+fn parent_watch() -> impl Fn() -> bool {
+    use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+    };
+    let handle = std::env::var("SKUA_PARENT_PID")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        // SAFETY: OpenProcess has no preconditions; a null handle means it failed.
+        .map(|pid| unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) } as usize)
+        .filter(|h| *h != 0);
+    // The handle stays open for the player's life, so the id cannot be reused.
+    move || match handle {
+        // SAFETY: the handle is a process handle opened above, never closed.
+        Some(h) => (unsafe { WaitForSingleObject(h as _, 0) }) == WAIT_TIMEOUT,
+        None => true,
+    }
+}
+
+/// Sleeps until the wake-up pipe or the socket can be read (or the socket
+/// written, with `write`), or `timeout_ms` passes (-1: no limit).
+#[cfg(unix)]
+fn wait(wake: &WakeStream, socket: Option<&TcpStream>, write: bool, timeout_ms: i32) {
+    let mut fds = vec![libc::pollfd {
+        fd: wake.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    }];
+    if let Some(socket) = socket {
+        let events = libc::POLLIN | if write { libc::POLLOUT } else { 0 };
+        fds.push(libc::pollfd {
+            fd: socket.as_raw_fd(),
+            events,
+            revents: 0,
+        });
+    }
+    // SAFETY: fds is a valid, initialised pollfd array for the whole call.
+    unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout_ms) };
+}
+
+#[cfg(windows)]
+fn wait(wake: &WakeStream, socket: Option<&TcpStream>, write: bool, timeout_ms: i32) {
+    use windows_sys::Win32::Networking::WinSock::{POLLRDNORM, POLLWRNORM, WSAPOLLFD, WSAPoll};
+    let mut fds = vec![WSAPOLLFD {
+        fd: wake.as_raw_socket() as _,
+        events: POLLRDNORM,
+        revents: 0,
+    }];
+    if let Some(socket) = socket {
+        fds.push(WSAPOLLFD {
+            fd: socket.as_raw_socket() as _,
+            events: POLLRDNORM | if write { POLLWRNORM } else { 0 },
+            revents: 0,
+        });
+    }
+    // SAFETY: fds is a valid, initialised WSAPOLLFD array for the whole call.
+    unsafe { WSAPoll(fds.as_mut_ptr(), fds.len() as u32, timeout_ms) };
+}
 
 fn send_to_skua(text: String) {
     if let Some((tx, wake)) = OUTGOING.get()
@@ -434,8 +608,7 @@ pub fn start(
         RENDER_CAP_FPS.store(fps, Ordering::Relaxed);
     }
     let (tx, rx) = mpsc::channel();
-    let (wake_tx, wake_rx) =
-        UnixStream::pair().expect("could not create the Skua bridge wake-up pipe");
+    let (wake_tx, wake_rx) = wake_pair().expect("could not create the Skua bridge wake-up pipe");
     let _ = wake_tx.set_nonblocking(true);
     let _ = wake_rx.set_nonblocking(true);
     if OUTGOING.set((tx, wake_tx)).is_err() {
@@ -455,7 +628,7 @@ pub fn start(
 fn run(
     url: &str,
     rx: mpsc::Receiver<String>,
-    mut wake: UnixStream,
+    mut wake: WakeStream,
     event_loop: EventLoopProxy<RuffleEvent>,
 ) {
     let mut socket: Option<WebSocket<TcpStream>> = None;
@@ -468,17 +641,16 @@ fn run(
         }
     };
     // Skua started this player; if Skua goes away without ending it (killed outright),
-    // the player is re-parented and nothing drives it any more: exit.
-    // SAFETY: getppid has no preconditions.
-    let parent = unsafe { libc::getppid() };
+    // nothing drives the player any more: exit.
+    let parent_alive = parent_watch();
     let would_block = |e: &tungstenite::Error| matches!(e, tungstenite::Error::Io(e) if e.kind() == ErrorKind::WouldBlock);
     loop {
         // Clear the wake-ups; the channel holds the messages.
         let mut buf = [0u8; 64];
         while matches!(wake.read(&mut buf), Ok(n) if n > 0) {}
 
-        if socket.is_none() && unsafe { libc::getppid() } != parent {
-            tracing::info!("skua bridge: Skua is gone (the player was re-parented); exiting");
+        if socket.is_none() && !parent_alive() {
+            tracing::info!("skua bridge: Skua is gone; exiting");
             std::process::exit(0);
         }
 
@@ -579,21 +751,12 @@ fn run(
                 .as_millis()
                 .clamp(1, 15_000) as i32,
         };
-        let mut fds = vec![libc::pollfd {
-            fd: wake.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        }];
-        if let Some(ws) = &socket {
-            let events = libc::POLLIN | if wants_write { libc::POLLOUT } else { 0 };
-            fds.push(libc::pollfd {
-                fd: ws.get_ref().as_raw_fd(),
-                events,
-                revents: 0,
-            });
-        }
-        // SAFETY: fds is a valid, initialised pollfd array for the whole call.
-        unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout_ms) };
+        wait(
+            &wake,
+            socket.as_ref().map(|ws| ws.get_ref()),
+            wants_write,
+            timeout_ms,
+        );
     }
 }
 
@@ -830,7 +993,7 @@ fn page_call(name: &str, args: &[ExternalValue]) -> Result<Json, String> {
     match name {
         "pauseDrawing" => {
             let paused = matches!(args.first(), Some(ExternalValue::Bool(true)));
-            DRAWING_PAUSED.store(paused, Ordering::Relaxed);
+            set_paused(paused);
             Ok(Json::Bool(true))
         }
         "setRender" => {
@@ -840,7 +1003,7 @@ fn page_call(name: &str, args: &[ExternalValue]) -> Result<Json, String> {
                         RENDER_CAP_FPS.store(*fps as u32, Ordering::Relaxed)
                     }
                     Some(ExternalValue::Number(fps)) if *fps <= 0.0 => {
-                        DRAWING_PAUSED.store(true, Ordering::Relaxed)
+                        set_paused(true)
                     }
                     Some(_) => RENDER_CAP_FPS.store(0, Ordering::Relaxed),
                     None => {}
@@ -923,6 +1086,22 @@ pub fn memory_stats_due() -> bool {
 }
 
 /// This process's resident memory in MB (0 if /proc can't say).
+#[cfg(windows)]
+fn rss_mb() -> u64 {
+    use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    // SAFETY: an all-zero PROCESS_MEMORY_COUNTERS is valid; the call fills it in.
+    let mut counters: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    // SAFETY: counters is as large as the size passed.
+    if unsafe { GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, size) } == 0 {
+        return 0;
+    }
+    // The working set: what Windows calls resident.
+    counters.WorkingSetSize as u64 / (1024 * 1024)
+}
+
+#[cfg(not(windows))]
 fn rss_mb() -> u64 {
     std::fs::read_to_string("/proc/self/statm")
         .ok()
@@ -938,7 +1117,7 @@ fn rss_mb() -> u64 {
 /// 150 MB since the last trim (checked once a minute). With SKUA_MEMORY_STATS
 /// on, logs what it gave back. RUFFLE_MALLOC_TRIM=0 turns it off.
 pub fn trim_after_full_gc() {
-    #[cfg(target_env = "gnu")]
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
         static SEEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         static ON: OnceLock<bool> = OnceLock::new();
@@ -1016,7 +1195,7 @@ fn rss_split() -> String {
         field("RssFile:"),
         field("RssShmem:")
     );
-    #[cfg(target_env = "gnu")]
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
         // mallinfo, not mallinfo2 (glibc 2.33+): int fields, fine below 2 GB.
         #[allow(deprecated)]

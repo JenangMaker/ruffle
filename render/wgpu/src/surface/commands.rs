@@ -11,7 +11,7 @@ use crate::surface::target::CommandTarget;
 use crate::{Descriptors, MaskState, Pipelines, PosUvVertex, Transforms, as_texture};
 use ruffle_render::backend::ShapeHandle;
 use ruffle_render::bitmap::{BitmapHandle, PixelRegion, PixelSnapping};
-use ruffle_render::commands::{CommandHandler, CommandList, RenderBlendMode};
+use ruffle_render::commands::{Command, CommandHandler, CommandList, RenderBlendMode};
 use ruffle_render::lines::{emulate_line, emulate_line_rect};
 use ruffle_render::matrix::Matrix;
 use ruffle_render::pixel_bender::PixelBenderShaderHandle;
@@ -29,6 +29,22 @@ pub struct CommandRenderer<'encoder> {
     mask_state: MaskState,
     needs_stencil: bool,
     dynamic_vertex_buffer: &'encoder wgpu::Buffer,
+    state: PassStateCache,
+}
+
+/// VibeSkua: what this pass last set, so the same pipeline, bind group,
+/// buffers or stencil reference are not set again for the next draw. Every
+/// shape draw set all of them: ~15,500 commands a frame in AQW's Battleon
+/// with filters off, and wgpu checks and records each one when the command
+/// buffer is finished (most of a frame's drawing time on Windows). Starts
+/// empty for each pass.
+#[derive(Default)]
+struct PassStateCache {
+    pipeline: std::cell::Cell<usize>,
+    group2: std::cell::Cell<usize>,
+    vertex: std::cell::Cell<(usize, u64, u64)>,
+    index: std::cell::Cell<(usize, u64, u64)>,
+    stencil: std::cell::Cell<Option<u32>>,
 }
 
 impl<'encoder> CommandRenderer<'encoder> {
@@ -48,6 +64,45 @@ impl<'encoder> CommandRenderer<'encoder> {
             descriptors,
             needs_stencil,
             dynamic_vertex_buffer,
+            state: PassStateCache::default(),
+        }
+    }
+
+    fn set_pipeline(&self, render_pass: &mut wgpu::RenderPass<'encoder>, pipeline: &'encoder wgpu::RenderPipeline) {
+        let key = pipeline as *const _ as usize;
+        if self.state.pipeline.replace(key) != key {
+            render_pass.set_pipeline(pipeline);
+        }
+    }
+
+    fn set_group2(&self, render_pass: &mut wgpu::RenderPass<'encoder>, bind_group: &'encoder wgpu::BindGroup) {
+        let key = bind_group as *const _ as usize;
+        if self.state.group2.replace(key) != key {
+            render_pass.set_bind_group(2, bind_group, &[]);
+        }
+    }
+
+    fn set_stencil(&self, render_pass: &mut wgpu::RenderPass<'encoder>, reference: u32) {
+        if self.state.stencil.replace(Some(reference)) != Some(reference) {
+            render_pass.set_stencil_reference(reference);
+        }
+    }
+
+    fn set_buffers(
+        &self,
+        render_pass: &mut wgpu::RenderPass<'encoder>,
+        vertices: &'encoder wgpu::Buffer,
+        vertex_range: std::ops::Range<wgpu::BufferAddress>,
+        indices: &'encoder wgpu::Buffer,
+        index_range: std::ops::Range<wgpu::BufferAddress>,
+    ) {
+        let key = (vertices as *const _ as usize, vertex_range.start, vertex_range.end);
+        if self.state.vertex.replace(key) != key {
+            render_pass.set_vertex_buffer(0, vertices.slice(vertex_range));
+        }
+        let key = (indices as *const _ as usize, index_range.start, index_range.end);
+        if self.state.index.replace(key) != key {
+            render_pass.set_index_buffer(indices.slice(index_range), wgpu::IndexFormat::Uint32);
         }
     }
 
@@ -60,13 +115,13 @@ impl<'encoder> CommandRenderer<'encoder> {
             match self.mask_state {
                 MaskState::NoMask => {}
                 MaskState::DrawMaskStencil => {
-                    render_pass.set_stencil_reference(self.num_masks - 1);
+                    self.set_stencil(render_pass, self.num_masks - 1);
                 }
                 MaskState::DrawMaskedContent => {
-                    render_pass.set_stencil_reference(self.num_masks);
+                    self.set_stencil(render_pass, self.num_masks);
                 }
                 MaskState::ClearMaskStencil => {
-                    render_pass.set_stencil_reference(self.num_masks);
+                    self.set_stencil(render_pass, self.num_masks);
                 }
             }
         }
@@ -122,17 +177,17 @@ impl<'encoder> CommandRenderer<'encoder> {
 
     pub fn prep_color(&self, render_pass: &mut wgpu::RenderPass<'encoder>) {
         if self.needs_stencil {
-            render_pass.set_pipeline(self.pipelines.color.pipeline_for(self.mask_state));
+            self.set_pipeline(render_pass, self.pipelines.color.pipeline_for(self.mask_state));
         } else {
-            render_pass.set_pipeline(self.pipelines.color.stencilless_pipeline());
+            self.set_pipeline(render_pass, self.pipelines.color.stencilless_pipeline());
         }
     }
 
     pub fn prep_lines(&self, render_pass: &mut wgpu::RenderPass<'encoder>) {
         if self.needs_stencil {
-            render_pass.set_pipeline(self.pipelines.lines.pipeline_for(self.mask_state));
+            self.set_pipeline(render_pass, self.pipelines.lines.pipeline_for(self.mask_state));
         } else {
-            render_pass.set_pipeline(self.pipelines.lines.stencilless_pipeline());
+            self.set_pipeline(render_pass, self.pipelines.lines.stencilless_pipeline());
         }
     }
 
@@ -142,12 +197,12 @@ impl<'encoder> CommandRenderer<'encoder> {
         bind_group: &'encoder wgpu::BindGroup,
     ) {
         if self.needs_stencil {
-            render_pass.set_pipeline(self.pipelines.gradients.pipeline_for(self.mask_state));
+            self.set_pipeline(render_pass, self.pipelines.gradients.pipeline_for(self.mask_state));
         } else {
-            render_pass.set_pipeline(self.pipelines.gradients.stencilless_pipeline());
+            self.set_pipeline(render_pass, self.pipelines.gradients.stencilless_pipeline());
         }
 
-        render_pass.set_bind_group(2, bind_group, &[]);
+        self.set_group2(render_pass, bind_group);
     }
 
     pub fn prep_bitmap(
@@ -159,21 +214,20 @@ impl<'encoder> CommandRenderer<'encoder> {
     ) {
         match (self.needs_stencil, render_stage3d) {
             (true, true) => {
-                render_pass.set_pipeline(&self.pipelines.bitmap_opaque_dummy_stencil);
+                self.set_pipeline(render_pass, &self.pipelines.bitmap_opaque_dummy_stencil);
             }
             (true, false) => {
-                render_pass
-                    .set_pipeline(self.pipelines.bitmap[blend_mode].pipeline_for(self.mask_state));
+                self.set_pipeline(render_pass, self.pipelines.bitmap[blend_mode].pipeline_for(self.mask_state));
             }
             (false, true) => {
-                render_pass.set_pipeline(&self.pipelines.bitmap_opaque);
+                self.set_pipeline(render_pass, &self.pipelines.bitmap_opaque);
             }
             (false, false) => {
-                render_pass.set_pipeline(self.pipelines.bitmap[blend_mode].stencilless_pipeline());
+                self.set_pipeline(render_pass, self.pipelines.bitmap[blend_mode].stencilless_pipeline());
             }
         }
 
-        render_pass.set_bind_group(2, bind_group, &[]);
+        self.set_group2(render_pass, bind_group);
     }
 
     pub fn prep_alpha_mask(
@@ -182,24 +236,26 @@ impl<'encoder> CommandRenderer<'encoder> {
         bind_group: &'encoder wgpu::BindGroup,
     ) {
         if self.needs_stencil {
-            render_pass.set_pipeline(self.pipelines.alpha_mask.pipeline_for(self.mask_state));
+            self.set_pipeline(render_pass, self.pipelines.alpha_mask.pipeline_for(self.mask_state));
         } else {
-            render_pass.set_pipeline(self.pipelines.alpha_mask.stencilless_pipeline());
+            self.set_pipeline(render_pass, self.pipelines.alpha_mask.stencilless_pipeline());
         }
 
-        render_pass.set_bind_group(2, bind_group, &[]);
+        self.set_group2(render_pass, bind_group);
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn draw(
         &self,
         render_pass: &mut wgpu::RenderPass<'encoder>,
-        vertices: wgpu::BufferSlice<'encoder>,
-        indices: wgpu::BufferSlice<'encoder>,
+        vertices: &'encoder wgpu::Buffer,
+        vertex_range: std::ops::Range<wgpu::BufferAddress>,
+        indices: &'encoder wgpu::Buffer,
+        index_range: std::ops::Range<wgpu::BufferAddress>,
         num_indices: u32,
         instance_index: u32,
     ) {
-        render_pass.set_vertex_buffer(0, vertices);
-        render_pass.set_index_buffer(indices, wgpu::IndexFormat::Uint32);
+        self.set_buffers(render_pass, vertices, vertex_range, indices, index_range);
 
         render_pass.draw_indexed(0..num_indices, 0, instance_index..(instance_index + 1));
     }
@@ -228,16 +284,22 @@ impl<'encoder> CommandRenderer<'encoder> {
         );
         self.prep_bitmap(render_pass, &bind.bind_group, blend_mode, render_stage3d);
 
-        let vertex_slice = if let Some(vertex_offset) = vertex_offset {
-            self.dynamic_vertex_buffer.slice(vertex_offset..)
+        let (vertex_buffer, vertex_range) = if let Some(vertex_offset) = vertex_offset {
+            (
+                self.dynamic_vertex_buffer,
+                vertex_offset..self.dynamic_vertex_buffer.size(),
+            )
         } else {
-            self.descriptors.quad.vertices_pos_uv.slice(..)
+            let quad = &self.descriptors.quad.vertices_pos_uv;
+            (quad, 0..quad.size())
         };
 
         self.draw(
             render_pass,
-            vertex_slice,
-            self.descriptors.quad.indices.slice(..),
+            vertex_buffer,
+            vertex_range,
+            &self.descriptors.quad.indices,
+            0..self.descriptors.quad.indices.size(),
             6,
             instance_index,
         );
@@ -254,8 +316,10 @@ impl<'encoder> CommandRenderer<'encoder> {
 
         self.draw(
             render_pass,
-            self.descriptors.quad.vertices_pos_uv.slice(..),
-            self.descriptors.quad.indices.slice(..),
+            &self.descriptors.quad.vertices_pos_uv,
+            0..self.descriptors.quad.vertices_pos_uv.size(),
+            &self.descriptors.quad.indices,
+            0..self.descriptors.quad.indices.size(),
             6,
             instance_index,
         );
@@ -295,8 +359,10 @@ impl<'encoder> CommandRenderer<'encoder> {
 
             self.draw(
                 render_pass,
-                mesh.vertex_buffer.slice(draw.vertices.clone()),
-                mesh.index_buffer.slice(draw.indices.clone()),
+                &mesh.vertex_buffer,
+                draw.vertices.clone(),
+                &mesh.index_buffer,
+                draw.indices.clone(),
                 num_indices,
                 instance_index,
             );
@@ -319,8 +385,10 @@ impl<'encoder> CommandRenderer<'encoder> {
 
         self.draw(
             render_pass,
-            self.descriptors.quad.vertices_pos.slice(..),
-            self.descriptors.quad.indices.slice(..),
+            &self.descriptors.quad.vertices_pos,
+            0..self.descriptors.quad.vertices_pos.size(),
+            &self.descriptors.quad.indices,
+            0..self.descriptors.quad.indices.size(),
             6,
             instance_index,
         );
@@ -335,8 +403,10 @@ impl<'encoder> CommandRenderer<'encoder> {
 
         self.draw(
             render_pass,
-            self.descriptors.quad.vertices_pos_color.slice(..),
-            self.descriptors.quad.indices.slice(..),
+            &self.descriptors.quad.vertices_pos_color,
+            0..self.descriptors.quad.vertices_pos_color.size(),
+            &self.descriptors.quad.indices,
+            0..self.descriptors.quad.indices.size(),
             6,
             instance_index,
         );
@@ -351,11 +421,17 @@ impl<'encoder> CommandRenderer<'encoder> {
 
         self.draw(
             render_pass,
-            self.descriptors.quad.vertices_pos_color.slice(..),
+            &self.descriptors.quad.vertices_pos_color,
+            0..self.descriptors.quad.vertices_pos_color.size(),
             if RECT {
-                self.descriptors.quad.indices_line_rect.slice(..)
+                &self.descriptors.quad.indices_line_rect
             } else {
-                self.descriptors.quad.indices_line.slice(..)
+                &self.descriptors.quad.indices_line
+            },
+            0..if RECT {
+                self.descriptors.quad.indices_line_rect.size()
+            } else {
+                self.descriptors.quad.indices_line.size()
             },
             if RECT { 5 } else { 2 },
             instance_index,
@@ -368,25 +444,25 @@ impl<'encoder> CommandRenderer<'encoder> {
         );
         self.num_masks += 1;
         self.mask_state = MaskState::DrawMaskStencil;
-        render_pass.set_stencil_reference(self.num_masks - 1);
+        self.set_stencil(render_pass, self.num_masks - 1);
     }
 
     pub fn activate_mask(&mut self, render_pass: &mut wgpu::RenderPass<'encoder>) {
         debug_assert!(self.num_masks > 0 && self.mask_state == MaskState::DrawMaskStencil);
         self.mask_state = MaskState::DrawMaskedContent;
-        render_pass.set_stencil_reference(self.num_masks);
+        self.set_stencil(render_pass, self.num_masks);
     }
 
     pub fn deactivate_mask(&mut self, render_pass: &mut wgpu::RenderPass<'encoder>) {
         debug_assert!(self.num_masks > 0 && self.mask_state == MaskState::DrawMaskedContent);
         self.mask_state = MaskState::ClearMaskStencil;
-        render_pass.set_stencil_reference(self.num_masks);
+        self.set_stencil(render_pass, self.num_masks);
     }
 
     pub fn pop_mask(&mut self, render_pass: &mut wgpu::RenderPass<'encoder>) {
         debug_assert!(self.num_masks > 0 && self.mask_state == MaskState::ClearMaskStencil);
         self.num_masks -= 1;
-        render_pass.set_stencil_reference(self.num_masks);
+        self.set_stencil(render_pass, self.num_masks);
         if self.num_masks == 0 {
             self.mask_state = MaskState::NoMask;
         } else {
@@ -414,7 +490,167 @@ pub enum Chunk {
         texture: PoolOrArcTexture,
         blend_mode: ChunkBlendMode,
         needs_stencil: bool,
+        /// The area the blend can change; None for all of the target.
+        rect: Option<BlendRect>,
     },
+}
+
+/// VibeSkua: the part of a target a blend works on, in its pixels.
+///
+/// Each blended object (Multiply, Overlay, Screen, Add, ...) was drawn into a
+/// fresh texture the size of the whole target, and a complex blend copied all
+/// of the parent and ran its shader over all of it. AQW's Battleon blends
+/// about 240 small objects a frame on a 1000 x 666 stage: ~330 full-size
+/// passes, 100-200 ms of an integrated GPU a frame (5 fps). Now the object is
+/// drawn into a texture of its own bounds, shifted there, and composited back
+/// over that area only. Outside the object the result is the parent as it
+/// was (transparent pixels add nothing, and complex blend shaders discard
+/// them), so the picture is the same.
+#[derive(Clone, Copy, Debug)]
+pub struct BlendRect {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Screen-space bounds of drawn commands, in target pixels.
+struct CommandBounds {
+    min: (f32, f32),
+    max: (f32, f32),
+}
+
+impl CommandBounds {
+    fn new() -> Self {
+        Self {
+            min: (f32::INFINITY, f32::INFINITY),
+            max: (f32::NEG_INFINITY, f32::NEG_INFINITY),
+        }
+    }
+
+    fn add_rect(&mut self, matrix: &Matrix, [x0, y0, x1, y1]: [f32; 4]) {
+        let (tx, ty) = (matrix.tx.to_pixels() as f32, matrix.ty.to_pixels() as f32);
+        for (x, y) in [(x0, y0), (x1, y0), (x0, y1), (x1, y1)] {
+            let px = matrix.a * x + matrix.c * y + tx;
+            let py = matrix.b * x + matrix.d * y + ty;
+            self.min = (self.min.0.min(px), self.min.1.min(py));
+            self.max = (self.max.0.max(px), self.max.1.max(py));
+        }
+    }
+
+    /// Adds what `commands` draw; false if that is not known (3D, Stage3D).
+    fn add(&mut self, commands: &[Command]) -> bool {
+        for command in commands {
+            let known = match command {
+                Command::RenderShape { shape, transform } => {
+                    transform.perspective_projection.is_none()
+                        && as_mesh(shape).bounds.is_none_or(|bounds| {
+                            self.add_rect(&transform.matrix, bounds);
+                            true
+                        })
+                }
+                Command::RenderBitmap {
+                    transform, region, ..
+                } => {
+                    let matrix = transform.matrix
+                        * Matrix::scale(region.width() as f32, region.height() as f32);
+                    self.add_rect(&matrix, [0.0, 0.0, 1.0, 1.0]);
+                    transform.perspective_projection.is_none()
+                }
+                Command::RenderStage3D { .. } => false,
+                Command::RenderAlphaMask {
+                    maskee_commands,
+                    mask_commands,
+                } => self.add(&maskee_commands.commands) && self.add(&mask_commands.commands),
+                Command::DrawRect { matrix, .. }
+                | Command::DrawLine { matrix, .. }
+                | Command::DrawLineRect { matrix, .. } => {
+                    self.add_rect(matrix, [0.0, 0.0, 1.0, 1.0]);
+                    true
+                }
+                Command::PushMask
+                | Command::ActivateMask
+                | Command::DeactivateMask
+                | Command::PopMask => true,
+                Command::Blend(commands, _) => self.add(&commands.commands),
+            };
+            if !known {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Moves what `commands` draw by (-dx, -dy), onto a blend texture whose
+/// top left corner is at (dx, dy) of its parent.
+fn translate_commands(commands: &mut [Command], dx: Twips, dy: Twips) {
+    let shift = |matrix: &mut Matrix| {
+        matrix.tx = Twips::new(matrix.tx.get() - dx.get());
+        matrix.ty = Twips::new(matrix.ty.get() - dy.get());
+    };
+    for command in commands {
+        match command {
+            Command::RenderBitmap { transform, .. }
+            | Command::RenderStage3D { transform, .. }
+            | Command::RenderShape { transform, .. } => shift(&mut transform.matrix),
+            Command::RenderAlphaMask {
+                maskee_commands,
+                mask_commands,
+            } => {
+                translate_commands(&mut maskee_commands.commands, dx, dy);
+                translate_commands(&mut mask_commands.commands, dx, dy);
+            }
+            Command::DrawRect { matrix, .. }
+            | Command::DrawLine { matrix, .. }
+            | Command::DrawLineRect { matrix, .. } => shift(matrix),
+            Command::PushMask
+            | Command::ActivateMask
+            | Command::DeactivateMask
+            | Command::PopMask => {}
+            Command::Blend(commands, _) => translate_commands(&mut commands.commands, dx, dy),
+        }
+    }
+}
+
+/// The area of a `width` x `height` target that `commands` can change, with a
+/// margin for pixel snapping, line widths and smoothing. None: all of it (the
+/// bounds are not known, or the area is most of the target anyway).
+/// Some with a zero size: they draw nothing on the target.
+fn blend_rect(commands: &CommandList, width: u32, height: u32) -> Option<BlendRect> {
+    let mut bounds = CommandBounds::new();
+    if !bounds.add(&commands.commands) {
+        return None;
+    }
+    const MARGIN: f32 = 2.0;
+    let clamp = |v: f32, max: u32| (v.max(0.0) as u32).min(max);
+    let x0 = clamp((bounds.min.0 - MARGIN).floor(), width);
+    let y0 = clamp((bounds.min.1 - MARGIN).floor(), height);
+    let x1 = clamp((bounds.max.0 + MARGIN).ceil(), width);
+    let y1 = clamp((bounds.max.1 + MARGIN).ceil(), height);
+    if !(bounds.min.0 <= bounds.max.0 && bounds.min.1 <= bounds.max.1) || x1 <= x0 || y1 <= y0 {
+        return Some(BlendRect {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+        });
+    }
+    // Sizes in steps of 64 (or the whole width or height), so the pooled
+    // textures are reused rather than made for every object size.
+    let step = |size: u32, max: u32| size.div_ceil(64).saturating_mul(64).min(max);
+    let (rect_width, rect_height) = (step(x1 - x0, width), step(y1 - y0, height));
+    let rect = BlendRect {
+        x: x0.min(width - rect_width),
+        y: y0.min(height - rect_height),
+        width: rect_width,
+        height: rect_height,
+    };
+    // Close to the whole target: not worth a partial copy.
+    if rect.width as u64 * rect.height as u64 * 4 > width as u64 * height as u64 * 3 {
+        return None;
+    }
+    Some(rect)
 }
 
 #[derive(Debug)]
@@ -514,8 +750,9 @@ pub fn chunk_blends<'encoder, 'global: 'encoder>(
     nearest_layer: LayerRef<'encoder>,
     texture_pool: &'encoder mut TexturePool,
     sink: Option<ChunkSink<'encoder, 'global>>,
+    opaque: bool,
 ) -> Vec<Chunk> {
-    WgpuCommandHandler::new(
+    let mut handler = WgpuCommandHandler::new(
         descriptors,
         staging_belt,
         dynamic_transforms,
@@ -527,8 +764,9 @@ pub fn chunk_blends<'encoder, 'global: 'encoder>(
         nearest_layer,
         texture_pool,
         sink,
-    )
-    .chunk_blends(commands)
+    );
+    handler.opaque = opaque;
+    handler.chunk_blends(commands)
 }
 
 struct WgpuCommandHandler<'encoder, 'global: 'encoder> {
@@ -544,6 +782,9 @@ struct WgpuCommandHandler<'encoder, 'global: 'encoder> {
     texture_pool: &'encoder mut TexturePool,
     emulate_lines: bool,
     sink: Option<ChunkSink<'encoder, 'global>>,
+    /// VibeSkua: the target was cleared to an opaque colour (the stage), so
+    /// it stays opaque: Multiply is then a plain hardware blend.
+    opaque: bool,
 
     result: Vec<Chunk>,
     current: Vec<DrawCommand>,
@@ -589,6 +830,7 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
             texture_pool,
             emulate_lines,
             sink,
+            opaque: false,
 
             result: vec![],
             current: vec![],
@@ -757,11 +999,31 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
             commands.execute(self);
             return;
         }
+        // Alpha and Erase change their layer outside the object too.
+        let rect = match BlendType::from(blend_mode.clone()) {
+            BlendType::Complex(ComplexBlend::Alpha | ComplexBlend::Erase) => None,
+            BlendType::Complex(_) | BlendType::Trivial(_) => {
+                blend_rect(&commands, self.width, self.height)
+            }
+            BlendType::Shader(_) => None,
+        };
+        let mut commands = commands;
+        if let Some(rect) = rect {
+            if rect.width == 0 {
+                // Off the target or empty: blending nothing changes nothing.
+                return;
+            }
+            translate_commands(
+                &mut commands.commands,
+                Twips::from_pixels_i32(rect.x as i32),
+                Twips::from_pixels_i32(rect.y as i32),
+            );
+        }
         let surface = Surface::new(
             self.descriptors,
             self.quality,
-            self.width,
-            self.height,
+            rect.map_or(self.width, |rect| rect.width),
+            rect.map_or(self.height, |rect| rect.height),
             wgpu::TextureFormat::Rgba8Unorm,
         );
         let target_layer = if let RenderBlendMode::Builtin(BlendMode::Layer) = &blend_mode {
@@ -769,7 +1031,12 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
         } else {
             self.nearest_layer
         };
-        let blend_type = BlendType::from(blend_mode);
+        let blend_type = match BlendType::from(blend_mode) {
+            BlendType::Complex(ComplexBlend::Multiply) if self.opaque => {
+                BlendType::Trivial(TrivialBlend::Multiply)
+            }
+            blend_type => blend_type,
+        };
         let clear_color = blend_type.default_color();
         let target = surface.draw_commands(
             RenderTargetMode::FreshWithColor(clear_color),
@@ -798,8 +1065,13 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
 
         match blend_type {
             BlendType::Trivial(blend_mode) => {
+                let mut matrix = Matrix::scale(target.width() as f32, target.height() as f32);
+                if let Some(rect) = rect {
+                    matrix.tx = Twips::from_pixels_i32(rect.x as i32);
+                    matrix.ty = Twips::from_pixels_i32(rect.y as i32);
+                }
                 let transform = Transform {
-                    matrix: Matrix::scale(target.width() as f32, target.height() as f32),
+                    matrix,
                     tz: 0.0,
                     color_transform: Default::default(),
                     perspective_projection: None,
@@ -861,6 +1133,7 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
                     texture: target.take_color_texture(),
                     blend_mode: chunk_blend_mode,
                     needs_stencil: self.num_masks > 0,
+                    rect,
                 };
                 self.push_chunk(chunk);
                 self.needs_stencil = self.num_masks > 0;

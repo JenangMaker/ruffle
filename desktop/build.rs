@@ -44,9 +44,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         if target.contains("msvc") {
             println!("cargo:rustc-link-arg=/STACK:4000000");
         } else {
-            println!("cargo:rustc-link-arg=-Xlinker");
-            println!("cargo:rustc-link-arg=--stack");
-            println!("cargo:rustc-link-arg=4000000");
+            // One argument: -Xlinker forwards only the next one, so a separate
+            // "4000000" reached gcc as an input file.
+            println!("cargo:rustc-link-arg=-Wl,--stack,4000000");
         }
     }
 

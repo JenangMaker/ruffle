@@ -80,6 +80,11 @@ pub trait RenderBackend: Any {
         false
     }
 
+    /// VibeSkua: nothing has been drawn for a while (a hidden or headless
+    /// tab): drop what only drawing needs, such as scratch textures. They
+    /// are made again when drawing resumes.
+    fn release_unused(&mut self) {}
+
     fn submit_frame(
         &mut self,
         clear: swf::Color,

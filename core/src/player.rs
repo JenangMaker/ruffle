@@ -364,6 +364,11 @@ pub struct Player {
     /// `finish_overdue_gc_cycle`).
     gc_cycle_ended: Instant,
     gc_cycle_running: bool,
+
+    /// How often the hover check runs with an idle mouse, and when it last
+    /// did (see `Player::update`).
+    idle_pick_interval: Duration,
+    idle_pick_at: Option<Instant>,
     /// When an overdue cycle was last given time; `None` when it isn't overdue.
     gc_helped: Option<Instant>,
 
@@ -2477,7 +2482,24 @@ impl Player {
         self.mutate_with_update_context(|context| {
             Self::update_drag(context);
         });
-        self.update_mouse_state(EnumSet::empty(), false, &mut false);
+        // With an idle mouse, the hover check can run less often than after
+        // every update (`PlayerBuilder::with_idle_pick_interval`; the desktop
+        // player uses 100 ms): each one hit-tests the whole display tree (its
+        // bounds alone visit every object), and the desktop player updates on
+        // every frame and on every tick between frames (timers, sockets,
+        // streams). In a crowded AQW room (~7,000 objects) that was about a
+        // third of the main thread of a tab being drawn. Mouse moves and
+        // clicks still check at once (`handle_event`); something that appears
+        // or goes away under an idle mouse is noticed within the interval.
+        if self.mouse_cursor_needs_check
+            || self.idle_pick_interval.is_zero()
+            || self
+                .idle_pick_at
+                .is_none_or(|t| t.elapsed() >= self.idle_pick_interval)
+        {
+            self.idle_pick_at = Some(Instant::now());
+            self.update_mouse_state(EnumSet::empty(), false, &mut false);
+        }
 
         Self::collect_garbage(&mut self.gc_arena.borrow_mut());
 
@@ -2606,6 +2628,35 @@ impl Player {
     /// Dictionaries. A movie stays alive as long as anything references it,
     /// so a map or asset that keeps appearing here after it was replaced has
     /// leaked.
+    /// VibeSkua: hands back what only drawing needs, once nothing has been
+    /// drawn for a while (a hidden or headless tab): every cacheAsBitmap
+    /// texture on the stage (with filters on AQW caches most characters and
+    /// their effects), every shape's meshes, and the renderer's scratch
+    /// textures. On the iGPUs this matters most for, GPU memory is RAM. All of
+    /// it is made again on the first frame drawn afterwards. Returns how many
+    /// cached textures and shapes' meshes were dropped.
+    pub fn release_render_resources(&mut self) -> (usize, usize) {
+        fn drop_caches(object: crate::display_object::DisplayObject<'_>) -> usize {
+            use crate::display_object::{TDisplayObject, TDisplayObjectContainer};
+            let mut dropped = object.base().drop_bitmap_cache_texture() as usize;
+            if let Some(container) = object.as_container() {
+                for child in container.iter_render_list() {
+                    dropped += drop_caches(child);
+                }
+            }
+            dropped
+        }
+        let dropped = self.mutate_with_update_context(|context| {
+            let caches = drop_caches(context.stage.into());
+            let meshes = context
+                .library
+                .expire_idle_meshes(crate::display_object::mesh_clock_ms(), 0);
+            (caches, meshes)
+        });
+        self.renderer.release_unused();
+        dropped
+    }
+
     pub fn debug_stats(&mut self) -> String {
         let gc_objects = self.gc_arena.borrow().metrics().total_gc_count();
         self.mutate_with_update_context(|context| {
@@ -2938,6 +2989,7 @@ pub struct PlayerBuilder {
     quality: StageQuality,
     page_url: Option<String>,
     frame_rate: Option<f64>,
+    idle_pick_interval: Duration,
     external_interface_provider: Option<Box<dyn ExternalInterfaceProvider>>,
     fs_command_provider: Box<dyn FsCommandProvider>,
     #[cfg(feature = "known_stubs")]
@@ -2995,6 +3047,7 @@ impl PlayerBuilder {
             quality: StageQuality::High,
             page_url: None,
             frame_rate: None,
+            idle_pick_interval: Duration::ZERO,
             external_interface_provider: None,
             fs_command_provider: Box::new(NullFsCommandProvider),
             #[cfg(feature = "known_stubs")]
@@ -3200,6 +3253,13 @@ impl PlayerBuilder {
         self
     }
 
+    /// How often to check what is under an idle mouse; zero (the default)
+    /// checks after every update. See `Player::update`.
+    pub fn with_idle_pick_interval(mut self, interval: Duration) -> Self {
+        self.idle_pick_interval = interval;
+        self
+    }
+
     /// Adds an External Interface provider for movies to communicate with
     pub fn with_external_interface(mut self, provider: Box<dyn ExternalInterfaceProvider>) -> Self {
         self.external_interface_provider = Some(provider);
@@ -3359,6 +3419,8 @@ impl PlayerBuilder {
 
                 gc_cycle_ended: Instant::now(),
                 gc_cycle_running: false,
+                idle_pick_interval: self.idle_pick_interval,
+                idle_pick_at: None,
                 gc_helped: None,
 
                 // Timing
