@@ -588,6 +588,32 @@ impl ApplicationHandler<RuffleEvent> for App {
                     startup_notify::reset_activation_token_env();
                     window_attributes = window_attributes.with_activation_token(token);
                 }
+                // VibeSkua: SKUA_PARENT_XID makes the window an X11 sub-window
+                // of VibeSkua's tab host from the start, instead of a top-level
+                // that VibeSkua moves into its own with XReparentWindow after.
+                // GNOME's Mutter (Wayland) routes keyboard events by Wayland
+                // surface and does not re-route them after a cross-client
+                // reparent, so the game stops receiving keys. A sub-window has
+                // no Wayland surface of its own under XWayland, so keystrokes
+                // reach it through the host's. Decimal or 0x-prefixed hex.
+                if let Some(parent) = std::env::var("SKUA_PARENT_XID")
+                    .ok()
+                    .and_then(|v| {
+                        let v = v.trim();
+                        if let Some(hex) = v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
+                            u32::from_str_radix(hex, 16).ok()
+                        } else {
+                            v.parse::<u32>().ok()
+                        }
+                    })
+                    .filter(|&id| id != 0)
+                {
+                    use winit::platform::x11::WindowAttributesExtX11;
+                    window_attributes = window_attributes
+                        .with_embed_parent_window(parent)
+                        .with_decorations(false);
+                    tracing::warn!("drawing inside X11 window 0x{parent:x} (SKUA_PARENT_XID)");
+                }
             }
 
             let event_loop_proxy = self.event_loop_proxy.clone();
