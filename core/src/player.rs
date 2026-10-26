@@ -387,6 +387,13 @@ pub struct Player {
     frame_accumulator: FloatDuration,
     recent_run_frame_timings: VecDeque<f64>,
 
+    /// Catch up at most one frame per tick, and only when it and a drawn
+    /// frame still fit in one frame time (`PlayerBuilder::with_catch_up_cap`).
+    catch_up_cap: bool,
+    /// How long `render` takes, in ms (a moving average), and when it last ran.
+    recent_render_time: f64,
+    last_render_at: Option<Instant>,
+
     /// Faked time passage for fooling hand-written busy-loop FPS limiters.
     time_offset: u32,
 
@@ -537,6 +544,26 @@ impl Player {
     fn max_frames_per_tick(&self) -> u32 {
         const MAX_FRAMES_PER_TICK: u32 = 5;
 
+        // VibeSkua: a frame run to catch up delays the next picture, and a tab
+        // that is behind is usually behind because frames or drawing are slow,
+        // so up to five in a row made a lagging tab burst the CPU and draw
+        // even later. With the cap, one extra frame at most, and only when two
+        // frames and a drawn picture (if it draws) fit in one frame time;
+        // otherwise the game slows down instead, as Flash Player does.
+        if self.catch_up_cap {
+            if self.recent_run_frame_timings.is_empty() {
+                return 1;
+            }
+            let frame_time = self.frame_time(1000.0);
+            let run = self.recent_run_frame_timings.iter().sum::<f64>()
+                / self.recent_run_frame_timings.len() as f64;
+            let draw = match self.last_render_at {
+                Some(at) if at.elapsed() < Duration::from_secs(1) => self.recent_render_time,
+                _ => 0.0,
+            };
+            return if 2.0 * run + draw <= frame_time { 2 } else { 1 };
+        }
+
         if self.recent_run_frame_timings.is_empty() {
             5
         } else {
@@ -573,16 +600,29 @@ impl Player {
             return;
         }
 
-        // Every 5 s: drop the meshes of shapes not drawn for 20 s (made again
-        // when next drawn), see `Graphic::expire_meshes`.
+        // Every 5 s: drop the meshes of shapes not drawn for
+        // RUFFLE_MESH_IDLE_SECONDS (default 20; made again when next drawn),
+        // see `Graphic::expire_meshes`. Longer is not better yet: 300 s kept
+        // far more mesh buffers alive, and wgpu-core's work for each render pass
+        // grows with the buffers alive (finishing a frame of ~300 passes went
+        // from ~15-25 ms to 55-75 ms in Yulgar), more than the tessellation
+        // it saved when walking.
         {
             use std::sync::atomic::{AtomicU64, Ordering};
             static LAST_SWEEP_MS: AtomicU64 = AtomicU64::new(0);
+            static IDLE_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+            let idle_ms = *IDLE_MS.get_or_init(|| {
+                std::env::var("RUFFLE_MESH_IDLE_SECONDS")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .unwrap_or(20)
+                    .saturating_mul(1000)
+            });
             let now = crate::display_object::mesh_clock_ms();
             if now.saturating_sub(LAST_SWEEP_MS.load(Ordering::Relaxed)) >= 5_000 {
                 LAST_SWEEP_MS.store(now, Ordering::Relaxed);
                 self.mutate_with_update_context(|context| {
-                    context.library.expire_idle_meshes(now, 20_000);
+                    context.library.expire_idle_meshes(now, idle_ms);
                 });
             }
         }
@@ -596,7 +636,7 @@ impl Player {
         while frame < max_frames_per_tick && self.frame_accumulator >= frame_duration {
             let timer = Instant::now();
             self.run_frame();
-            let elapsed = timer.elapsed().as_millis() as f64;
+            let elapsed = timer.elapsed().as_secs_f64() * 1000.0;
 
             self.add_frame_timing(elapsed);
 
@@ -2133,6 +2173,7 @@ impl Player {
 
     #[instrument(level = "debug", skip_all)]
     pub fn render(&mut self) {
+        let render_started = Instant::now();
         let invalidated = self.enter_arena(|_, gc_root, _| gc_root.stage.invalidated());
 
         if invalidated {
@@ -2188,6 +2229,13 @@ impl Player {
             .submit_frame(background_color, commands, cache_draws);
 
         self.needs_render = false;
+        let render_ms = render_started.elapsed().as_secs_f64() * 1000.0;
+        self.recent_render_time = if self.last_render_at.is_some() {
+            self.recent_render_time * 0.9 + render_ms * 0.1
+        } else {
+            render_ms
+        };
+        self.last_render_at = Some(Instant::now());
     }
 
     /// The current frame of the main timeline, if available.
@@ -2990,6 +3038,7 @@ pub struct PlayerBuilder {
     page_url: Option<String>,
     frame_rate: Option<f64>,
     idle_pick_interval: Duration,
+    catch_up_cap: bool,
     external_interface_provider: Option<Box<dyn ExternalInterfaceProvider>>,
     fs_command_provider: Box<dyn FsCommandProvider>,
     #[cfg(feature = "known_stubs")]
@@ -3048,6 +3097,7 @@ impl PlayerBuilder {
             page_url: None,
             frame_rate: None,
             idle_pick_interval: Duration::ZERO,
+            catch_up_cap: false,
             external_interface_provider: None,
             fs_command_provider: Box::new(NullFsCommandProvider),
             #[cfg(feature = "known_stubs")]
@@ -3260,6 +3310,14 @@ impl PlayerBuilder {
         self
     }
 
+    /// Whether a tick that is behind catches up at most one frame, and only
+    /// when it and a drawn frame still fit in one frame time (false, the
+    /// default: up to five frames, see `Player::max_frames_per_tick`).
+    pub fn with_catch_up_cap(mut self, cap: bool) -> Self {
+        self.catch_up_cap = cap;
+        self
+    }
+
     /// Adds an External Interface provider for movies to communicate with
     pub fn with_external_interface(mut self, provider: Box<dyn ExternalInterfaceProvider>) -> Self {
         self.external_interface_provider = Some(provider);
@@ -3429,6 +3487,9 @@ impl PlayerBuilder {
                 frame_phase: Default::default(),
                 frame_accumulator: FloatDuration::ZERO,
                 recent_run_frame_timings: VecDeque::with_capacity(10),
+                catch_up_cap: self.catch_up_cap,
+                recent_render_time: 0.0,
+                last_render_at: None,
                 start_time: Instant::now(),
                 time_offset: 0,
                 time_til_next_timer: None,

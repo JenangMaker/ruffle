@@ -22,7 +22,7 @@ pub struct Descriptors {
     pub quad: Quad,
     copy_pipeline: Mutex<FnvHashMap<(u32, wgpu::TextureFormat), wgpu::RenderPipeline>>,
     pub shaders: Shaders,
-    pipelines: Mutex<FnvHashMap<(u32, wgpu::TextureFormat), Arc<Pipelines>>>,
+    pipelines: Mutex<FnvHashMap<(u32, wgpu::TextureFormat, bool), Arc<Pipelines>>>,
     pub filters: Filters,
 }
 
@@ -132,19 +132,31 @@ impl Descriptors {
             .clone()
     }
 
-    pub fn pipelines(&self, msaa_sample_count: u32, format: wgpu::TextureFormat) -> Arc<Pipelines> {
+    /// VibeSkua: `edge_aa` draws shapes with their edge fringes (see
+    /// `crate::backend::edge_aa`).
+    pub fn pipelines(
+        &self,
+        msaa_sample_count: u32,
+        format: wgpu::TextureFormat,
+        edge_aa: bool,
+    ) -> Arc<Pipelines> {
         let mut pipelines = self
             .pipelines
             .lock()
             .expect("Pipelines should not be already locked");
         pipelines
-            .entry((msaa_sample_count, format))
+            .entry((msaa_sample_count, format, edge_aa))
             .or_insert_with(|| {
                 Arc::new(Pipelines::new(
                     &self.device,
                     &self.shaders,
                     format,
                     msaa_sample_count,
+                    if edge_aa {
+                        crate::backend::edge_aa()
+                    } else {
+                        None
+                    },
                     &self.bind_layouts,
                 ))
             })
@@ -182,36 +194,44 @@ impl Quad {
             PosUvVertex {
                 position: [0.0, 0.0],
                 uv: [0.0, 0.0, 1.0],
+                aa: [0; 4],
             },
             PosUvVertex {
                 position: [1.0, 0.0],
                 uv: [1.0, 0.0, 1.0],
+                aa: [0; 4],
             },
             PosUvVertex {
                 position: [1.0, 1.0],
                 uv: [1.0, 1.0, 1.0],
+                aa: [0; 4],
             },
             PosUvVertex {
                 position: [0.0, 1.0],
                 uv: [0.0, 1.0, 1.0],
+                aa: [0; 4],
             },
         ];
         let vertices_pos_color = [
             PosColorVertex {
                 position: [0.0, 0.0],
                 color: [1.0, 1.0, 1.0, 1.0],
+                aa: [0; 4],
             },
             PosColorVertex {
                 position: [1.0, 0.0],
                 color: [1.0, 1.0, 1.0, 1.0],
+                aa: [0; 4],
             },
             PosColorVertex {
                 position: [1.0, 1.0],
                 color: [1.0, 1.0, 1.0, 1.0],
+                aa: [0; 4],
             },
             PosColorVertex {
                 position: [0.0, 1.0],
                 color: [1.0, 1.0, 1.0, 1.0],
+                aa: [0; 4],
             },
         ];
         let filter_vertices = [

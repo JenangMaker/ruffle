@@ -33,6 +33,11 @@ use self::commands::ChunkBlendMode;
 /// has ~180 of these blends a frame in Battleon. It is now the first draw of
 /// the next pass (a pass of its own only when another copy of the parent
 /// comes first, its stencil use differs, or nothing follows).
+///
+/// Blends waiting together form a group: a blend whose rect overlaps none of
+/// the waiting ones reads parent pixels they do not change, so its parent copy
+/// can be taken before they are drawn and all of them share one pass. A full
+/// Battleon drew ~120 blends a frame in passes of their own before this.
 struct PendingBlend<'a> {
     pipeline: &'a wgpu::RenderPipeline,
     bind_group: wgpu::BindGroup,
@@ -84,18 +89,39 @@ impl PendingBlend<'_> {
         }
     }
 
+    /// Whether this blend can join `group`: same stencil use, and its rect
+    /// overlaps none of theirs (a blend draws only inside its rect).
+    fn fits(rect: Option<BlendRect>, needs_stencil: bool, group: &[Self]) -> bool {
+        let Some(rect) = rect else {
+            return false;
+        };
+        group.iter().all(|other| {
+            other.needs_stencil == needs_stencil
+                && other.rect.is_some_and(|o| {
+                    rect.x >= o.x + o.width
+                        || o.x >= rect.x + rect.width
+                        || rect.y >= o.y + o.height
+                        || o.y >= rect.y + rect.height
+                })
+        })
+    }
+
+    /// Draws the waiting group in one pass of its own.
     fn draw_alone<'global>(
-        self,
+        group: &mut Vec<Self>,
         descriptors: &Descriptors,
         target: &CommandTarget,
         draw_encoder: &mut Scope<'global, wgpu::CommandEncoder>,
         texture_pool: &mut TexturePool,
     ) {
+        let Some(first) = group.first() else {
+            return;
+        };
         let mut render_pass = draw_encoder.scoped_render_pass(
             "Complex blend",
             wgpu::RenderPassDescriptor {
                 color_attachments: &[target.color_attachments()],
-                depth_stencil_attachment: if self.needs_stencil {
+                depth_stencil_attachment: if first.needs_stencil {
                     target.stencil_attachment(descriptors, texture_pool)
                 } else {
                     None
@@ -103,7 +129,9 @@ impl PendingBlend<'_> {
                 ..Default::default()
             },
         );
-        self.draw(&mut render_pass, descriptors, target);
+        for blend in group.drain(..) {
+            blend.draw(&mut render_pass, descriptors, target);
+        }
     }
 }
 
@@ -130,12 +158,24 @@ impl Surface {
             depth_or_array_layers: 1,
         };
 
-        let sample_count = supported_sample_count(
-            &descriptors.adapter,
-            quality.sample_count(),
+        // VibeSkua: with edge smoothing (RUFFLE_EDGE_AA) shapes get edge
+        // fringes instead of multisampling, above Low quality (Flash's Low
+        // smoothed nothing).
+        let edge_aa = crate::backend::edge_aa().is_some();
+        let sample_count = if edge_aa {
+            1
+        } else {
+            supported_sample_count(
+                &descriptors.adapter,
+                quality.sample_count(),
+                frame_buffer_format,
+            )
+        };
+        let pipelines = descriptors.pipelines(
+            sample_count,
             frame_buffer_format,
+            edge_aa && quality != StageQuality::Low,
         );
-        let pipelines = descriptors.pipelines(sample_count, frame_buffer_format);
         Self {
             size,
             quality,
@@ -212,7 +252,7 @@ impl Surface {
         let mut mask_state = MaskState::NoMask;
         // VibeSkua: a complex blend is drawn at the start of the next draw
         // pass instead of in a pass of its own (see PendingBlend).
-        let mut pending: Option<PendingBlend<'_>> = None;
+        let mut pending: Vec<PendingBlend<'_>> = Vec::new();
         // VibeSkua: each chunk runs as soon as chunk_blends makes it (see
         // WgpuCommandHandler::push_chunk).
         let mut execute = |chunk: Chunk,
@@ -226,15 +266,19 @@ impl Surface {
                     transforms,
                     vertices,
                 } => {
+                    // Between passes: the frame's encoder may be cut here.
+                    crate::split_encoder::cut(&descriptors.device, &mut **draw_encoder);
                     // Its pipeline must match this pass's stencil attachment.
-                    let blend_first = match pending.take() {
-                        Some(blend) if blend.needs_stencil == needs_stencil => Some(blend),
-                        Some(blend) => {
-                            blend.draw_alone(descriptors, &target, draw_encoder, texture_pool);
-                            None
-                        }
-                        None => None,
-                    };
+                    if pending.first().is_some_and(|b| b.needs_stencil != needs_stencil) {
+                        PendingBlend::draw_alone(
+                            &mut pending,
+                            descriptors,
+                            &target,
+                            draw_encoder,
+                            texture_pool,
+                        );
+                    }
+                    let blends_first = std::mem::take(&mut pending);
                     transforms.copy_to(staging_belt, draw_encoder, &dynamic_transforms.buffer);
                     vertices.copy_to(
                         staging_belt,
@@ -260,7 +304,7 @@ impl Surface {
                             ..Default::default()
                         },
                     );
-                    if let Some(blend) = blend_first {
+                    for blend in blends_first {
                         blend.draw(&mut render_pass, descriptors, &target);
                     }
                     render_pass.set_bind_group(0, target.globals().bind_group(), &[]);
@@ -288,9 +332,13 @@ impl Surface {
                     ..
                 } => {
                     assert!(!needs_stencil, "Shader blend mode not implemented in masks");
-                    if let Some(earlier) = pending.take() {
-                        earlier.draw_alone(descriptors, &target, draw_encoder, texture_pool);
-                    }
+                    PendingBlend::draw_alone(
+                        &mut pending,
+                        descriptors,
+                        &target,
+                        draw_encoder,
+                        texture_pool,
+                    );
                     let parent_blend_buffer =
                         target.update_blend_buffer(descriptors, texture_pool, draw_encoder);
                     run_pixelbender_shader_impl(
@@ -341,9 +389,18 @@ impl Surface {
                         _ => &target,
                     };
 
-                    // The copy below must include an earlier blend's result.
-                    if let Some(earlier) = pending.take() {
-                        earlier.draw_alone(descriptors, &target, draw_encoder, texture_pool);
+                    // The copy below must include an earlier blend's result,
+                    // unless that blend draws outside the copied rect.
+                    if !(std::ptr::eq(parent, &target)
+                        && PendingBlend::fits(rect, needs_stencil, &pending))
+                    {
+                        PendingBlend::draw_alone(
+                            &mut pending,
+                            descriptors,
+                            &target,
+                            draw_encoder,
+                            texture_pool,
+                        );
                     }
                     let mut copy_scope = draw_encoder.scope("Copy parent for blend");
                     let parent_copy = rect.map(|rect| {
@@ -410,7 +467,7 @@ impl Surface {
                             None,
                         )
                     };
-                    pending = Some(PendingBlend {
+                    pending.push(PendingBlend {
                         pipeline,
                         bind_group,
                         rect,
@@ -443,9 +500,13 @@ impl Surface {
         for chunk in chunks {
             execute(chunk, staging_belt, draw_encoder, texture_pool);
         }
-        if let Some(last) = pending {
-            last.draw_alone(descriptors, &target, draw_encoder, texture_pool);
-        }
+        PendingBlend::draw_alone(
+            &mut pending,
+            descriptors,
+            &target,
+            draw_encoder,
+            texture_pool,
+        );
 
         // If nothing happened, ensure it's cleared so we don't operate on garbage data
         target.ensure_cleared(draw_encoder);

@@ -5,6 +5,7 @@ struct VertexOutput {
     @location(0) uv: vec2<f32>,
     @location(1) mult_color: vec4<f32>,
     @location(2) add_color: vec4<f32>,
+    @location(3) coverage: f32,
 };
 
 @group(1) @binding(0) var<uniform> transforms: array<common__Transforms, max_transforms>;
@@ -21,9 +22,11 @@ struct Gradient {
 @group(2) @binding(2) var texture_sampler: sampler;
 
 @vertex
-fn main_vertex(in: common__VertexInputUv, @builtin(instance_index) instanceIndex: u32) -> VertexOutput {
-    let pos = common__globals.global_matrix * (transforms[instanceIndex].world_matrix * vec4<f32>(in.position.x, in.position.y, 0.0, 1.0));
-    return VertexOutput(pos, in.uv.xy / in.uv.z, transforms[instanceIndex].mult_color, transforms[instanceIndex].add_color);
+fn main_vertex(in: common__VertexInputUvAa, @builtin(instance_index) instanceIndex: u32) -> VertexOutput {
+    let world_matrix = transforms[instanceIndex].world_matrix;
+    var pos = common__globals.global_matrix * (world_matrix * vec4<f32>(in.position.x, in.position.y, 0.0, 1.0));
+    pos = common__edge_position(pos, world_matrix, in.aa);
+    return VertexOutput(pos, in.uv.xy / in.uv.z, transforms[instanceIndex].mult_color, transforms[instanceIndex].add_color, common__edge_coverage(in.aa));
 }
 
 fn find_t(uv: vec2<f32>) -> f32 {
@@ -72,5 +75,5 @@ fn main_fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     }
     let out = saturate(color * in.mult_color + in.add_color);
     let alpha = saturate(out.a);
-    return vec4<f32>(out.rgb * alpha, alpha);
+    return vec4<f32>(out.rgb * alpha, alpha) * in.coverage;
 }

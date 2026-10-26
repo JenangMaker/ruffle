@@ -48,6 +48,7 @@ mod filters;
 mod layouts;
 mod mesh;
 mod shaders;
+mod split_encoder;
 mod surface;
 
 impl BitmapHandleImpl for Texture {}
@@ -95,19 +96,35 @@ impl From<TessVertex> for PosVertex {
 struct PosUvVertex {
     position: [f32; 2],
     uv: [f32; 3],
+    /// VibeSkua: edge fringe data (see `pack_aa`).
+    aa: [i16; 4],
+}
+
+/// VibeSkua: a tessellator vertex's `aa` (edge fringe: normal, side, flag;
+/// all in -1..1) as the shaders' Snorm16x4 attribute.
+fn pack_aa(aa: [f32; 4]) -> [i16; 4] {
+    aa.map(|v| (v.clamp(-1.0, 1.0) * 32767.0).round() as i16)
 }
 
 impl PosUvVertex {
     pub fn new(x: f32, y: f32, u: f32, v: f32, t: f32) -> Self {
         let position = [x, y];
         let uv = [u, v, t];
-        Self { position, uv }
+        Self {
+            position,
+            uv,
+            aa: [0; 4],
+        }
     }
 
     pub fn from_tessellator(vertex: TessVertex, texture_matrix: &[[f32; 3]; 3]) -> Self {
         let position = [vertex.x, vertex.y];
         let uv = Self::transform_uv(texture_matrix, vertex.x, vertex.y);
-        Self { position, uv }
+        Self {
+            position,
+            uv,
+            aa: pack_aa(vertex.aa),
+        }
     }
 
     fn transform_uv(matrix: &[[f32; 3]; 3], x: f32, y: f32) -> [f32; 3] {
@@ -124,6 +141,8 @@ impl PosUvVertex {
 struct PosColorVertex {
     position: [f32; 2],
     color: [f32; 4],
+    /// VibeSkua: edge fringe data (see `pack_aa`).
+    aa: [i16; 4],
 }
 
 impl From<TessVertex> for PosColorVertex {
@@ -136,6 +155,7 @@ impl From<TessVertex> for PosColorVertex {
                 f32::from(vertex.color.b) / 255.0,
                 f32::from(vertex.color.a) / 255.0,
             ],
+            aa: pack_aa(vertex.aa),
         }
     }
 }

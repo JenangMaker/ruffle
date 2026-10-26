@@ -2,7 +2,7 @@ use crate::buffer_builder::BufferBuilder;
 use crate::buffer_pool::{BufferPool, TexturePool};
 use crate::context3d::WgpuContext3D;
 use crate::dynamic_transforms::DynamicTransforms;
-use crate::filters::FilterSource;
+use crate::filters::{FilterBatch, FilterSource};
 use crate::mesh::{CommonGradient, Mesh, PendingDraw};
 use crate::pixel_bender::{ShaderMode, run_pixelbender_shader_impl};
 use crate::surface::{LayerRef, Surface};
@@ -273,7 +273,11 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             target,
             surface,
             meshes: Vec::new(),
-            shape_tessellator: ShapeTessellator::new(),
+            shape_tessellator: {
+                let mut tessellator = ShapeTessellator::new();
+                tessellator.set_edge_fringe(edge_aa().is_some());
+                tessellator
+            },
             viewport_scale_factor: 1.0,
             texture_pool: TexturePool::new(),
             offscreen_texture_pool: TexturePool::new(),
@@ -584,8 +588,22 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             return;
         };
 
+        // VibeSkua: the frame's commands go into several encoders, finished
+        // in parallel at submit (split_encoder.rs).
+        crate::split_encoder::begin();
+        // VibeSkua: blurs and glows of cached bitmaps drawn together (filters/batch.rs).
+        let mut batch = FilterBatch::default();
         for entry in cache_entries {
             let texture = as_texture(&entry.handle);
+            // Cached children come before their parents: a parent that draws a
+            // bitmap still waiting for its filters gets it finished first.
+            if batch.is_used_by(&entry.commands) {
+                batch.run(
+                    &self.descriptors,
+                    &mut self.active_frame.command_encoder,
+                    &mut self.offscreen_texture_pool,
+                );
+            }
             let surface = Surface::new(
                 &self.descriptors,
                 self.surface.quality(),
@@ -616,6 +634,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                     &mut self.offscreen_texture_pool,
                 );
             } else {
+                let batched = {
                 let mut scope = self
                     .profiler
                     .scope("Filters", &mut self.active_frame.command_encoder);
@@ -642,6 +661,11 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                     LayerRef::None,
                     &mut self.offscreen_texture_pool,
                 );
+                if FilterBatch::accepts(&entry.filters, &texture.texture)
+                    && *target.color_texture() == texture.texture
+                {
+                    Some(entry.filters)
+                } else {
                 for filter in entry.filters {
                     target = self.descriptors.filters.apply(
                         &self.descriptors,
@@ -652,22 +676,62 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                         filter,
                     );
                 }
-                run_copy_pipeline(
-                    &self.descriptors,
-                    texture.texture.format(),
-                    &texture.texture.create_view(&Default::default()),
-                    target.color_view(),
-                    target.globals(),
-                    target.color_texture().sample_count(),
-                    &mut scope.scope("Copy filtered to CAB"),
-                );
+                // VibeSkua: the copy pipeline draws the filtered texture over
+                // the cached one pixel for pixel, so when both have the same
+                // size, format and a single sample, a texture copy is the same
+                // result without a render pass (one each per filtered object;
+                // passes are most of a frame's CPU cost on built-in graphics).
+                let filtered = target.color_texture();
+                if filtered.size() == texture.texture.size()
+                    && filtered.format() == texture.texture.format()
+                    && filtered.sample_count() == 1
+                    && texture.texture.sample_count() == 1
+                {
+                    scope.scope("Copy filtered to CAB").copy_texture_to_texture(
+                        filtered.as_image_copy(),
+                        texture.texture.as_image_copy(),
+                        texture.texture.size(),
+                    );
+                } else {
+                    run_copy_pipeline(
+                        &self.descriptors,
+                        texture.texture.format(),
+                        &texture.texture.create_view(&Default::default()),
+                        target.color_view(),
+                        target.globals(),
+                        target.color_texture().sample_count(),
+                        &mut scope.scope("Copy filtered to CAB"),
+                    );
+                }
+                None
+                }
+                };
+                if let Some(filters) = batched
+                    && let Err(filters) = batch.push(&texture.texture, filters)
+                {
+                    batch.run(
+                        &self.descriptors,
+                        &mut self.active_frame.command_encoder,
+                        &mut self.offscreen_texture_pool,
+                    );
+                    let _ = batch.push(&texture.texture, filters);
+                }
             }
             // Periodically flush GPU work to prevent OOM when many cache entries
             // accumulate (e.g. when a large container's cacheAsBitmap is skipped
             // but its hundreds of children each have their own bitmap caches).
             self.active_frame.maybe_flush(&self.descriptors);
+            crate::split_encoder::cut(
+                &self.descriptors.device,
+                &mut self.active_frame.command_encoder,
+            );
         }
 
+        batch.run(
+            &self.descriptors,
+            &mut self.active_frame.command_encoder,
+            &mut self.offscreen_texture_pool,
+        );
         self.surface.draw_commands_and_copy_to(
             frame_output.view(),
             RenderTargetMode::FreshWithColor(wgpu::Color {
@@ -690,6 +754,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         self.profiler
             .resolve_queries(&mut self.active_frame.command_encoder);
         self.active_frame.staging_belt.finish();
+        crate::split_encoder::end();
 
         let index = self
             .active_frame
@@ -1390,7 +1455,7 @@ impl ActiveFrame {
         let index = target.submit(
             &descriptors.device,
             &descriptors.queue,
-            Some(draw_encoder.finish()),
+            crate::split_encoder::finish_all(draw_encoder),
             frame,
         );
         self.staging_belt.recall();
@@ -1406,7 +1471,9 @@ impl ActiveFrame {
                 .device
                 .create_command_encoder(&Default::default()),
         );
-        let index = descriptors.queue.submit(Some(draw_encoder.finish()));
+        let index = descriptors
+            .queue
+            .submit(crate::split_encoder::finish_all(draw_encoder));
         self.staging_belt.recall();
         index
     }
@@ -1442,6 +1509,40 @@ fn capped_quality(quality: StageQuality) -> StageQuality {
         Some(cap) if quality.sample_count() > cap.sample_count() => *cap,
         _ => quality,
     }
+}
+
+/// VibeSkua: RUFFLE_EDGE_AA=on smooths shape edges the way Flash Player did,
+/// with a soft border along each edge (an edge fringe, see the tessellator's
+/// `add_edge_fringe`), instead of drawing everything 2-4 times over
+/// (multisampling, which it then replaces). Fills keep hard edges inside, and
+/// the fringe adds the part of each edge pixel the shape covers outside them.
+/// Returns the fringe's width in pixels and its coverage at the edge: 0.5
+/// and 0.5 by default, a pixel's coverage by a straight edge; a number
+/// instead of `on` sets the width, RUFFLE_EDGE_AA_INNER the coverage. Off by
+/// default (Ruffle as usual).
+pub(crate) fn edge_aa() -> Option<(f32, f32)> {
+    static EDGE: std::sync::OnceLock<Option<(f32, f32)>> = std::sync::OnceLock::new();
+    *EDGE.get_or_init(|| {
+        let value = std::env::var("RUFFLE_EDGE_AA").ok()?;
+        let value = value.trim();
+        let width = if value.eq_ignore_ascii_case("on")
+            || value == "1"
+            || value.eq_ignore_ascii_case("true")
+        {
+            0.5
+        } else {
+            value
+                .parse::<f32>()
+                .ok()
+                .filter(|w| *w > 0.0 && *w <= 4.0)?
+        };
+        let inner = std::env::var("RUFFLE_EDGE_AA_INNER")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|v| (0.0..=1.0).contains(v))
+            .unwrap_or(0.5);
+        Some((width, inner))
+    })
 }
 
 /// VibeSkua: RUFFLE_FILTERS=off draws as Ruffle's browser WebGL renderer does,
