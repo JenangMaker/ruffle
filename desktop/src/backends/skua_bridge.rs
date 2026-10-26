@@ -1149,6 +1149,9 @@ fn handle_key_event(args: &[ExternalValue], player: &mut Player) -> Result<Json,
         _ => KeyLocation::Standard,
     };
     let key = KeyDescriptor { physical_key, logical_key, key_location };
+    if ruffle_core::skua_stats::input_debug() {
+        eprintln!("[ruffle-input] bridge key {state} {physical_key:?} {logical_key:?}");
+    }
     match state {
         "down" => {
             let _ = player.handle_event(PlayerEvent::KeyDown { key });
