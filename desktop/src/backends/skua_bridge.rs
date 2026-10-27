@@ -22,9 +22,6 @@ use crate::backends::DesktopExternalInterfaceProvider;
 use crate::custom_event::RuffleEvent;
 use ruffle_core::Player;
 use ruffle_core::context::UpdateContext;
-use ruffle_core::events::{
-    KeyDescriptor, KeyLocation, LogicalKey, NamedKey, PhysicalKey, PlayerEvent, TextControlCode,
-};
 use ruffle_core::external::{ExternalInterfaceProvider, Value as ExternalValue};
 use serde_json::{Map, Value as Json, json};
 use std::collections::{BTreeMap, VecDeque};
@@ -913,7 +910,7 @@ pub fn handle_call(player: &mut Player, text: &str) {
         player.handle_event(ruffle_core::events::PlayerEvent::MouseLeave);
     }
     let result = match name.strip_prefix("page.") {
-        Some(page) => page_call(page, &args, player),
+        Some(page) => page_call(page, &args),
         None if player.has_internal_interface(name) => {
             Ok(to_json(&player.call_internal_interface(name, args)))
         }
@@ -1075,11 +1072,8 @@ fn take_replies() -> String {
 
 /// The page's own functions (window.vibeskua in the browser build):
 /// pauseDrawing(paused), setRender({fps}) and getRender(). TabThrottle
-/// pauses drawing for hidden and headless tabs. VibeSkua's desktop host also
-/// uses `keyEvent` and `textInput` to forward keyboard events it caught on
-/// its own window into the player, side-stepping the GNOME/Mutter XWayland
-/// keyboard-routing limitation across clients (see GameEmbed).
-fn page_call(name: &str, args: &[ExternalValue], player: &mut Player) -> Result<Json, String> {
+/// pauses drawing for hidden and headless tabs.
+fn page_call(name: &str, args: &[ExternalValue]) -> Result<Json, String> {
     match name {
         "pauseDrawing" => {
             let paused = matches!(args.first(), Some(ExternalValue::Bool(true)));
@@ -1115,212 +1109,8 @@ fn page_call(name: &str, args: &[ExternalValue], player: &mut Player) -> Result<
             };
             Ok(json!({ "fps": fps, "scale": 1, "paused": DRAWING_PAUSED.load(Ordering::Relaxed) }))
         }
-        "keyEvent" => handle_key_event(args, player),
-        "textInput" => handle_text_input(args, player),
         _ => Err(format!("no page function named {name}")),
     }
-}
-
-/// Forwards a key event sent by VibeSkua's host from its own window into the
-/// player. GNOME/Mutter routes keyboard events by Wayland surface, which
-/// belongs to the host (one X11 toplevel = one Wayland surface), so an X11
-/// sub-window owned by another client (us) never sees them directly even when
-/// X11 input focus is on it. The host subscribes to KeyDown/KeyUp on its
-/// Avalonia window and relays each one here while the pointer is over the
-/// game area. Expected args[0]:
-///   { state: "down"|"up", code: "<PhysicalKey name>", key: "<char or NamedKey>",
-///     location: "standard"|"left"|"right"|"numpad" }
-/// The strings follow the DOM UIEvents spec (same spellings as our enums).
-fn handle_key_event(args: &[ExternalValue], player: &mut Player) -> Result<Json, String> {
-    let Some(ExternalValue::Object(obj)) = args.first() else {
-        return Err("expected an object".into());
-    };
-    let get_str = |k: &str| match obj.get(k) {
-        Some(ExternalValue::String(s)) => Some(s.as_str()),
-        _ => None,
-    };
-    let state = get_str("state").ok_or_else(|| "missing state".to_string())?;
-    let physical_key = parse_physical_key(get_str("code").unwrap_or(""));
-    let logical_key = parse_logical_key(get_str("key").unwrap_or(""));
-    let key_location = match get_str("location").unwrap_or("standard") {
-        "left" => KeyLocation::Left,
-        "right" => KeyLocation::Right,
-        "numpad" => KeyLocation::Numpad,
-        _ => KeyLocation::Standard,
-    };
-    let key = KeyDescriptor { physical_key, logical_key, key_location };
-    if ruffle_core::skua_stats::input_debug() {
-        eprintln!("[ruffle-input] bridge key {state} {physical_key:?} {logical_key:?}");
-    }
-    match state {
-        "down" => {
-            let _ = player.handle_event(PlayerEvent::KeyDown { key });
-            if let Some(code) = text_control_from_key(&key, obj) {
-                let _ = player.handle_event(PlayerEvent::TextControl { code });
-            }
-        }
-        "up" => { let _ = player.handle_event(PlayerEvent::KeyUp { key }); }
-        _ => return Err(format!("state must be \"down\" or \"up\", not {state:?}")),
-    }
-    Ok(Json::Bool(true))
-}
-
-/// Pairs with KeyDown for printable characters, as app.rs::winit_to_ruffle_text_control
-/// does: Ctrl+A/C/V/X, cursor moves inside text fields.
-fn text_control_from_key(key: &KeyDescriptor, modifiers: &BTreeMap<String, ExternalValue>) -> Option<TextControlCode> {
-    let is = |k: &str| matches!(modifiers.get(k), Some(ExternalValue::Bool(true)));
-    let shift = is("shift");
-    let ctrl_cmd = is("ctrl") || (is("meta") && cfg!(target_os = "macos"));
-    match key.logical_key {
-        LogicalKey::Named(NamedKey::Enter) => Some(TextControlCode::Enter),
-        LogicalKey::Character('a') | LogicalKey::Character('A') if ctrl_cmd => Some(TextControlCode::SelectAll),
-        LogicalKey::Character('c') | LogicalKey::Character('C') if ctrl_cmd => Some(TextControlCode::Copy),
-        LogicalKey::Character('v') | LogicalKey::Character('V') if ctrl_cmd => Some(TextControlCode::Paste),
-        LogicalKey::Character('x') | LogicalKey::Character('X') if ctrl_cmd => Some(TextControlCode::Cut),
-        LogicalKey::Named(NamedKey::Backspace) if ctrl_cmd => Some(TextControlCode::BackspaceWord),
-        LogicalKey::Named(NamedKey::Backspace) => Some(TextControlCode::Backspace),
-        LogicalKey::Named(NamedKey::Delete) if ctrl_cmd => Some(TextControlCode::DeleteWord),
-        LogicalKey::Named(NamedKey::Delete) => Some(TextControlCode::Delete),
-        LogicalKey::Named(NamedKey::ArrowLeft) if ctrl_cmd && shift => Some(TextControlCode::SelectLeftWord),
-        LogicalKey::Named(NamedKey::ArrowLeft) if ctrl_cmd => Some(TextControlCode::MoveLeftWord),
-        LogicalKey::Named(NamedKey::ArrowLeft) if shift => Some(TextControlCode::SelectLeft),
-        LogicalKey::Named(NamedKey::ArrowLeft) => Some(TextControlCode::MoveLeft),
-        LogicalKey::Named(NamedKey::ArrowRight) if ctrl_cmd && shift => Some(TextControlCode::SelectRightWord),
-        LogicalKey::Named(NamedKey::ArrowRight) if ctrl_cmd => Some(TextControlCode::MoveRightWord),
-        LogicalKey::Named(NamedKey::ArrowRight) if shift => Some(TextControlCode::SelectRight),
-        LogicalKey::Named(NamedKey::ArrowRight) => Some(TextControlCode::MoveRight),
-        LogicalKey::Named(NamedKey::Home) => Some(TextControlCode::MoveLeftLine),
-        LogicalKey::Named(NamedKey::End) => Some(TextControlCode::MoveRightLine),
-        _ => None,
-    }
-}
-
-/// Each character goes to the player as a `TextInput` event, as the browser
-/// build's keyboard input does.
-fn handle_text_input(args: &[ExternalValue], player: &mut Player) -> Result<Json, String> {
-    let Some(ExternalValue::String(text)) = args.first() else {
-        return Err("expected a string".into());
-    };
-    for codepoint in text.chars() {
-        let _ = player.handle_event(PlayerEvent::TextInput { codepoint });
-    }
-    Ok(Json::Bool(true))
-}
-
-/// DOM `KeyboardEvent.code` string (e.g. "KeyA", "Digit1", "Enter",
-/// "ShiftLeft") to our PhysicalKey. Variant names follow the same spec, so
-/// this is mostly a stringify-the-enum mapping. Unknown codes map to
-/// Unknown, which the player tolerates: logical_key still carries the text.
-fn parse_physical_key(code: &str) -> PhysicalKey {
-    match code {
-        "Backquote" => PhysicalKey::Backquote,
-        "Digit0" => PhysicalKey::Digit0, "Digit1" => PhysicalKey::Digit1,
-        "Digit2" => PhysicalKey::Digit2, "Digit3" => PhysicalKey::Digit3,
-        "Digit4" => PhysicalKey::Digit4, "Digit5" => PhysicalKey::Digit5,
-        "Digit6" => PhysicalKey::Digit6, "Digit7" => PhysicalKey::Digit7,
-        "Digit8" => PhysicalKey::Digit8, "Digit9" => PhysicalKey::Digit9,
-        "Minus" => PhysicalKey::Minus, "Equal" => PhysicalKey::Equal,
-        "KeyA" => PhysicalKey::KeyA, "KeyB" => PhysicalKey::KeyB,
-        "KeyC" => PhysicalKey::KeyC, "KeyD" => PhysicalKey::KeyD,
-        "KeyE" => PhysicalKey::KeyE, "KeyF" => PhysicalKey::KeyF,
-        "KeyG" => PhysicalKey::KeyG, "KeyH" => PhysicalKey::KeyH,
-        "KeyI" => PhysicalKey::KeyI, "KeyJ" => PhysicalKey::KeyJ,
-        "KeyK" => PhysicalKey::KeyK, "KeyL" => PhysicalKey::KeyL,
-        "KeyM" => PhysicalKey::KeyM, "KeyN" => PhysicalKey::KeyN,
-        "KeyO" => PhysicalKey::KeyO, "KeyP" => PhysicalKey::KeyP,
-        "KeyQ" => PhysicalKey::KeyQ, "KeyR" => PhysicalKey::KeyR,
-        "KeyS" => PhysicalKey::KeyS, "KeyT" => PhysicalKey::KeyT,
-        "KeyU" => PhysicalKey::KeyU, "KeyV" => PhysicalKey::KeyV,
-        "KeyW" => PhysicalKey::KeyW, "KeyX" => PhysicalKey::KeyX,
-        "KeyY" => PhysicalKey::KeyY, "KeyZ" => PhysicalKey::KeyZ,
-        "BracketLeft" => PhysicalKey::BracketLeft, "BracketRight" => PhysicalKey::BracketRight,
-        "Backslash" => PhysicalKey::Backslash, "Semicolon" => PhysicalKey::Semicolon,
-        "Quote" => PhysicalKey::Quote, "Comma" => PhysicalKey::Comma,
-        "Period" => PhysicalKey::Period, "Slash" => PhysicalKey::Slash,
-        "Backspace" => PhysicalKey::Backspace, "Tab" => PhysicalKey::Tab,
-        "CapsLock" => PhysicalKey::CapsLock, "Enter" => PhysicalKey::Enter,
-        "ShiftLeft" => PhysicalKey::ShiftLeft, "ShiftRight" => PhysicalKey::ShiftRight,
-        "ControlLeft" => PhysicalKey::ControlLeft, "ControlRight" => PhysicalKey::ControlRight,
-        "AltLeft" => PhysicalKey::AltLeft, "AltRight" => PhysicalKey::AltRight,
-        "SuperLeft" | "MetaLeft" | "OSLeft" => PhysicalKey::SuperLeft,
-        "SuperRight" | "MetaRight" | "OSRight" => PhysicalKey::SuperRight,
-        "Space" => PhysicalKey::Space, "ContextMenu" => PhysicalKey::ContextMenu,
-        "Insert" => PhysicalKey::Insert, "Delete" => PhysicalKey::Delete,
-        "Home" => PhysicalKey::Home, "End" => PhysicalKey::End,
-        "PageUp" => PhysicalKey::PageUp, "PageDown" => PhysicalKey::PageDown,
-        "ArrowUp" => PhysicalKey::ArrowUp, "ArrowDown" => PhysicalKey::ArrowDown,
-        "ArrowLeft" => PhysicalKey::ArrowLeft, "ArrowRight" => PhysicalKey::ArrowRight,
-        "NumLock" => PhysicalKey::NumLock,
-        "NumpadDivide" => PhysicalKey::NumpadDivide,
-        "NumpadMultiply" => PhysicalKey::NumpadMultiply,
-        "NumpadSubtract" => PhysicalKey::NumpadSubtract,
-        "NumpadAdd" => PhysicalKey::NumpadAdd,
-        "NumpadEnter" => PhysicalKey::NumpadEnter,
-        "NumpadDecimal" => PhysicalKey::NumpadDecimal,
-        "Numpad0" => PhysicalKey::Numpad0, "Numpad1" => PhysicalKey::Numpad1,
-        "Numpad2" => PhysicalKey::Numpad2, "Numpad3" => PhysicalKey::Numpad3,
-        "Numpad4" => PhysicalKey::Numpad4, "Numpad5" => PhysicalKey::Numpad5,
-        "Numpad6" => PhysicalKey::Numpad6, "Numpad7" => PhysicalKey::Numpad7,
-        "Numpad8" => PhysicalKey::Numpad8, "Numpad9" => PhysicalKey::Numpad9,
-        "Escape" => PhysicalKey::Escape,
-        "F1" => PhysicalKey::F1, "F2" => PhysicalKey::F2,
-        "F3" => PhysicalKey::F3, "F4" => PhysicalKey::F4,
-        "F5" => PhysicalKey::F5, "F6" => PhysicalKey::F6,
-        "F7" => PhysicalKey::F7, "F8" => PhysicalKey::F8,
-        "F9" => PhysicalKey::F9, "F10" => PhysicalKey::F10,
-        "F11" => PhysicalKey::F11, "F12" => PhysicalKey::F12,
-        "PrintScreen" => PhysicalKey::PrintScreen,
-        "ScrollLock" => PhysicalKey::ScrollLock,
-        "Pause" => PhysicalKey::Pause,
-        _ => PhysicalKey::Unknown,
-    }
-}
-
-/// DOM `KeyboardEvent.key` string to our LogicalKey. A single character maps
-/// to Character(char); anything else goes through parse_named_key.
-fn parse_logical_key(key: &str) -> LogicalKey {
-    if key.is_empty() {
-        return LogicalKey::Unknown;
-    }
-    let mut chars = key.chars();
-    let first = chars.next().unwrap();
-    if chars.next().is_none() {
-        return LogicalKey::Character(first);
-    }
-    match parse_named_key(key) {
-        Some(named) => LogicalKey::Named(named),
-        None => LogicalKey::Unknown,
-    }
-}
-
-fn parse_named_key(name: &str) -> Option<NamedKey> {
-    Some(match name {
-        "Alt" => NamedKey::Alt, "AltGraph" => NamedKey::AltGraph,
-        "CapsLock" => NamedKey::CapsLock, "Control" => NamedKey::Control,
-        "Fn" => NamedKey::Fn, "FnLock" => NamedKey::FnLock,
-        "Meta" | "Super" | "OS" => NamedKey::Super,
-        "NumLock" => NamedKey::NumLock, "ScrollLock" => NamedKey::ScrollLock,
-        "Shift" => NamedKey::Shift,
-        "Enter" => NamedKey::Enter, "Tab" => NamedKey::Tab,
-        "ArrowDown" => NamedKey::ArrowDown, "ArrowLeft" => NamedKey::ArrowLeft,
-        "ArrowRight" => NamedKey::ArrowRight, "ArrowUp" => NamedKey::ArrowUp,
-        "End" => NamedKey::End, "Home" => NamedKey::Home,
-        "PageDown" => NamedKey::PageDown, "PageUp" => NamedKey::PageUp,
-        "Backspace" => NamedKey::Backspace, "Clear" => NamedKey::Clear,
-        "Copy" => NamedKey::Copy, "Cut" => NamedKey::Cut,
-        "Delete" => NamedKey::Delete, "Insert" => NamedKey::Insert,
-        "Paste" => NamedKey::Paste, "Redo" => NamedKey::Redo, "Undo" => NamedKey::Undo,
-        "ContextMenu" => NamedKey::ContextMenu, "Escape" => NamedKey::Escape,
-        "Pause" => NamedKey::Pause, "Play" => NamedKey::Play, "Select" => NamedKey::Select,
-        "PrintScreen" => NamedKey::PrintScreen,
-        "F1" => NamedKey::F1, "F2" => NamedKey::F2,
-        "F3" => NamedKey::F3, "F4" => NamedKey::F4,
-        "F5" => NamedKey::F5, "F6" => NamedKey::F6,
-        "F7" => NamedKey::F7, "F8" => NamedKey::F8,
-        "F9" => NamedKey::F9, "F10" => NamedKey::F10,
-        "F11" => NamedKey::F11, "F12" => NamedKey::F12,
-        _ => return None,
-    })
 }
 
 fn to_json(value: &ExternalValue) -> Json {
