@@ -209,3 +209,4 @@ codegen-units = 64
 # ~40% of the main thread per frame in AQW. See vendor/wgpu-core/PATCHED.md.
 [patch.crates-io]
 wgpu-core = { path = "vendor/wgpu-core" }
+winit = { path = "vendor/winit" }
